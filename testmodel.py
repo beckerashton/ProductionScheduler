@@ -41,7 +41,7 @@ pd.set_option('display.width', 1000)
 class ProductionEvent:
     """Represents a production event with scheduling information."""
     order_id: int
-    design_loc_id: int
+    # design_loc_id: int
     order_design_name: str
     colors_total: int
     quantity: int
@@ -585,11 +585,6 @@ class ProductionScheduler:
         
         return event
     
-    def schedule_event_new(self, event: ProductionEvent) -> ProductionEvent:
-        # my custom verion of scheduling and event cause i dont 100% like the og one
-        # calc and assign prod time
-        
-
     def schedule_multiple_events(self, events: List[ProductionEvent], 
                                  prioritize_by_date: bool = True) -> List[ProductionEvent]:
         """
@@ -720,8 +715,7 @@ def fetch_unscheduled_orders(cnxn: Connection, days_ahead: int = 30, days_behind
                     eodl.ColorsTotal,
                     eodl.FlashesTotal,
                     eodl.cn_QtyToProduce,
-                    eo.date_OrderRequestedToShip,
-                    eodl.ID_OrderDesLoc
+                    eo.date_OrderRequestedToShip
                 FROM 
                     Events_OrderDesLoc eodl
                 INNER JOIN 
@@ -758,7 +752,7 @@ def fetch_unscheduled_orders(cnxn: Connection, days_ahead: int = 30, days_behind
             event = ProductionEvent(
                 order_id=int(row['id_Order']),
                 order_design_name=str(row['ct_DesignName']),
-                design_loc_id=int(row['ID_OrderDesLoc']),
+                # design_loc_id=int(row['ID_OrderDesLoc']),
                 colors_total=int(row['ColorsTotal']),
                 # stitches_total=int(row['StitchesTotal']),
                 quantity=int(row['cn_QtyToProduce']),
@@ -825,7 +819,7 @@ def create_sample_events() -> List[ProductionEvent]:
     events = [
         ProductionEvent(
             order_id=1001,
-            design_loc_id=5001,
+            # design_loc_id=5001,
             colors_total=4,
             order_design_name="Sample Design A",
             # stitches_total=15000,
@@ -836,7 +830,7 @@ def create_sample_events() -> List[ProductionEvent]:
         ),
         ProductionEvent(
             order_id=1002,
-            design_loc_id=5002,
+            # design_loc_id=5002,
             colors_total=8,
             order_design_name="Sample Design B",
             # stitches_total=35000,
@@ -847,7 +841,7 @@ def create_sample_events() -> List[ProductionEvent]:
         ),
         ProductionEvent(
             order_id=1003,
-            design_loc_id=5003,
+            # design_loc_id=5003,
             colors_total=2,
             order_design_name="Sample Design C",
             # stitches_total=8000,
@@ -858,7 +852,7 @@ def create_sample_events() -> List[ProductionEvent]:
         ),
         ProductionEvent(
             order_id=1004,
-            design_loc_id=5004,
+            # design_loc_id=5004,
             colors_total=6,
             order_design_name="Sample Design D",
             # stitches_total=22000,
@@ -869,7 +863,7 @@ def create_sample_events() -> List[ProductionEvent]:
         ),
         ProductionEvent(
             order_id=1005,
-            design_loc_id=5005,
+            # design_loc_id=5005,
             colors_total=10,
             order_design_name="Sample Design E",
             # stitches_total=45000,
@@ -983,10 +977,13 @@ def main(force_refresh: bool = False):
 def test() -> None:
     try:
         with getConnection(connectionString=CON_STRING.replace("?", "Data_Events")) as cnxn:
-            scheduler = ProductionScheduler(cnxn)
+            # scheduler = ProductionScheduler(cnxn)
 
-            
-            scheduler.schedule_event(testEvent1)
+
+                
+            # scheduler.schedule_multiple_events(unscheduled, prioritize_by_date= True)
+
+            # scheduler.schedule_event(testEvent1)
     except Exception as e:
         log.error(f"Error in test execution: {e}", exc_info=True)
         raise

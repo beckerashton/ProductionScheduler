@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 from pyodbc import Connection, Cursor, Row
 from contextlib import contextmanager
 from typing import Any, Generator, Optional, List, TypedDict, Dict, Callable
@@ -12,8 +13,12 @@ import pandas as pd
 import tempfile
 import subprocess
 
+from ProductionTypes import Machine
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+
+load_dotenv()
 
 PROFILES_PATH: str = os.path.normpath(os.getenv("PROFILES_JSON_PATH", ""))
 CON_STRING: str = os.getenv("DB_CONNECTION_STRING", "")
@@ -402,6 +407,19 @@ def refreshProfiles() -> bool:
     return False
 
 
+def getMachines() -> List[Machine]:
+    
+    with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+        df = qryToDataFrame(cnxn= cnxn, query="""
+            SELECT
+                ID_Machine,
+                MachineName,
+                MaxNumberOfColors
+            FROM
+                Events_Machine
+            WHERE
+                ID_Machine IN ('101', '102', '103', '104', '105', '106', '107')
+        """)
+        machines: List[Machine] = [Machine(machineId= row['ID_Machine'], machineName= row['MachineName'], heads= row['MaxNumberOfColors']) for _, row in df.iterrows()]
 
-
-
+    return machines

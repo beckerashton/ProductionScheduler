@@ -120,13 +120,11 @@ def showTablesJSON() -> List[str]:
         profiles: List[TableProfile] = json.load(f)
         return [profile["name"] for profile in profiles]
     
-
-
-
-
-
-
-
+def safeCast(val: Any, toType: type, default: Any = None) -> Any:
+    try:
+        return toType(val)
+    except (ValueError, TypeError):
+        return default
 
 
 
