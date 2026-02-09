@@ -459,3 +459,52 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
     except Exception as e:
         print(f"Error fetching unscheduled orders: {str(e)}")
         return []
+
+def getHistoricalScheduledOrders() -> List[ProductionEvent]:
+    query: str = f"""
+        SELECT
+            eodl.id_Order,
+            eod.ct_DesignName,
+            eodl.Location,
+            eodl.ColorsTotal,
+            eodl.FlashesTotal,
+            eodl.cn_QtyToProduce,
+            eo.date_OrderRequestedToShip
+        FROM 
+            Events_OrderDesLoc eodl
+        INNER JOIN 
+            Events_Order eo ON eodl.id_Order = eo.ID_Order
+        INNER JOIN
+            Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
+        WHERE
+            eodl.date_Creation >= '06/01/2024'
+            AND eo.date_OrderRequestedToShip >= '01/01/2025'
+            AND eo.date_OrderRequestedToShip <= '01/01/2026'
+            AND eodl.ColorsTotal > 0
+            AND eodl.cn_QtyToProduce > 0
+            AND eo.id_OrderType = 11
+            AND eo.sts_Shipped = 1
+        ORDER BY
+            eo.date_OrderRequestedToShip ASC
+    """
+
+    try:
+        with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+            df = qryToDataFrame(cnxn= cnxn, query= query)
+            events: List[ProductionEvent] = []
+            for _, row in df.iterrows():
+                event = ProductionEvent(
+                    orderId=sc(row['id_Order'], int),
+                    orderDesignName=sc(row['ct_DesignName'], str),
+                    printLocation=sc(row['Location'], str),
+                    colorsTotal=sc(row['ColorsTotal'], int, 0),
+                    flashesTotal=sc(row['FlashesTotal'], int, 0),
+                    quantity=sc(row['cn_QtyToProduce'], int, 0),
+                    priority=0,
+                    requestedShipDate=row['date_OrderRequestedToShip']
+                )
+                events.append(event)
+            return events
+    except Exception as e:
+        print(f"Error fetching historical scheduled orders: {str(e)}")
+        return []

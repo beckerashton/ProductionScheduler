@@ -40,6 +40,21 @@ class Scheduler:
 
         pass
 
+    def reqVsShippedDate(self) -> None:
+        data = pd.read_json('Outputs/scheduled_orders.json')
+        data['requestedShipDate'] = pd.to_datetime(data['requestedShipDate'])
+        data['scheduledStartDate'] = pd.to_datetime(data['scheduledStartDate'])
+        data = data.sort_values('requestedShipDate')
+        
+        data.plot(x='requestedShipDate', y='scheduledStartDate', kind='scatter', color='cyan')
+        plt.title('Requested Ship Date vs Scheduled Start Date')
+        plt.xlabel('Requested Ship Date')
+        plt.ylabel('Scheduled Start Date')
+        plt.grid()
+        mplcursors.cursor(hover=True)
+        #draw a line y=x for reference
+        plt.plot(data['requestedShipDate'], data['requestedShipDate'], color='red', linestyle='--')
+        plt.show()
 
 def colors() -> None:
     try:
@@ -90,6 +105,6 @@ if __name__ == "__main__":
     startTime: float = time.perf_counter()
     # colors()
     # main()
-    Scheduler().valueDistribution()
+    Scheduler().reqVsShippedDate()
     endTime: float = time.perf_counter()
     log.info(f"Script Time: {(endTime - startTime):.4f}s")

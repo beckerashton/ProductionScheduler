@@ -49,6 +49,7 @@ class ProductionEvent:
     scheduleValue: Optional[int] = None # Experimental value for scheduling priority
     scheduledStartDate: Optional[date] = None
     assignedMachineId: Optional[int] = None
+    estTime: Optional[int] = None # Estimated time in minutes
     @property
     def headsTotal(self) -> int:
         return self.colorsTotal + 2 * self.flashesTotal
@@ -64,7 +65,7 @@ class ProductionEvent:
         self.requestedShipDate = requestedShipDate
     
     def __str__(self):
-        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId})"
+        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId}, estTime={self.estTime})"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -78,7 +79,8 @@ class ProductionEvent:
             "requestedShipDate": self.requestedShipDate.isoformat(),
             "scheduleValue": self.scheduleValue,
             "scheduledStartDate": self.scheduledStartDate.isoformat() if self.scheduledStartDate else None,
-            "assignedMachineId": self.assignedMachineId
+            "assignedMachineId": self.assignedMachineId,
+            "estTime": self.estTime
         }
 
     @staticmethod
@@ -97,6 +99,7 @@ class ProductionEvent:
             event.scheduledStartDate = date.fromisoformat(data["scheduledStartDate"])
         event.assignedMachineId = data.get("assignedMachineId")
         event.scheduleValue = data.get("scheduleValue")
+        event.estTime = data.get("estTime")
         return event
    
 @dataclass
