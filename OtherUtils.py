@@ -1,8 +1,11 @@
-import os
 import json
-from typing import List, Dict, Any
+import os
+from typing import Any, Dict, List
+
 from dotenv import load_dotenv
-from DbUtils import TableProfile
+
+from Types import TableProfile
+
 load_dotenv()
 
 PROFILES_PATH: str = os.path.normpath(os.getenv("PROFILES_JSON_PATH", ""))

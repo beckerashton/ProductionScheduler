@@ -1,6 +1,7 @@
-from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import date
+from typing import Any, Dict, List, Optional, TypedDict
+
 
 @dataclass
 class WeekSchedule:
@@ -47,7 +48,7 @@ class ProductionEvent:
     # Calculated / derived attributes
     scheduleValue: Optional[int] = None # Experimental value for scheduling priority
     scheduledStartDate: Optional[date] = None
-    assignedMachine: Optional[int] = None
+    assignedMachineId: Optional[int] = None
     @property
     def headsTotal(self) -> int:
         return self.colorsTotal + 2 * self.flashesTotal
@@ -63,7 +64,7 @@ class ProductionEvent:
         self.requestedShipDate = requestedShipDate
     
     def __str__(self):
-        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachine={self.assignedMachine})"
+        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId})"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -77,7 +78,7 @@ class ProductionEvent:
             "requestedShipDate": self.requestedShipDate.isoformat(),
             "scheduleValue": self.scheduleValue,
             "scheduledStartDate": self.scheduledStartDate.isoformat() if self.scheduledStartDate else None,
-            "assignedMachine": self.assignedMachine
+            "assignedMachineId": self.assignedMachineId
         }
 
     @staticmethod
@@ -94,7 +95,7 @@ class ProductionEvent:
         )
         if data.get("scheduledStartDate"):
             event.scheduledStartDate = date.fromisoformat(data["scheduledStartDate"])
-        event.assignedMachine = data.get("assignedMachine")
+        event.assignedMachineId = data.get("assignedMachineId")
         event.scheduleValue = data.get("scheduleValue")
         return event
    
@@ -157,6 +158,24 @@ class Machine():
             schedule=schedule
          )
         return machine
+
+class TableProfile(TypedDict):
+    """
+    A TypedDict representing the profile information of a database table.
+
+    Attributes:
+        name (str): The name of the database table.
+        rowCount (int): The total number of rows in the table.
+        columns (List[Dict[str, str]]): A list of dictionaries containing 
+            column information, where each dictionary represents a column with 
+            string keys and string values (e.g., column name, data type, etc.).
+        dateRefreshed (str): The date and time when the table profile was last 
+            refreshed, typically in ISO format or other string representation.
+    """
+    name: str
+    rowCount: int
+    columns: List[Dict[str, str]]
+    dateRefreshed: str
 
 def DEBUG_loadFromJsonFile() -> List[ProductionEvent]:
     import json

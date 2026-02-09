@@ -1,23 +1,27 @@
 
 
-from datetime import date, timedelta
 import json
+import logging
+import os
+from datetime import date
 from time import perf_counter
 from typing import List
-from ProductionTypes import *
-from DbUtils import getConnection, getMachines, qryToDataFrame
-from OtherUtils import safeCast as sc
 
-import os
 import dotenv
+
+from DbUtils import getMachines, getUnscheduledOrders
+from Types import Machine, ProductionEvent, WeekSchedule
 
 dotenv.load_dotenv()
 
 CON_STRING: str = os.getenv("DB_CONNECTION_STRING", "")
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
 def fetchMachines() -> List[Machine]:
     try:
-        with open("machines.json", "r", encoding="utf-8") as mf:
+        with open("Outputs/machines.json", "r", encoding="utf-8") as mf:
             data: List[Machine] = json.load(mf)
             return [Machine.from_dict(item) for item in data]  # type: ignore (limitations of Dict based dataclass type hinting)          
     except:
@@ -26,63 +30,12 @@ def fetchMachines() -> List[Machine]:
         return machines
 
 def writeMachinesToJson(machines: List[Machine]) -> None:
-    with open("machines.json", "w", encoding="utf-8") as mf:
+    with open("Outputs/machines.json", "w", encoding="utf-8") as mf:
         json.dump([machine.to_dict() for machine in machines], mf, indent=4)
 
-def fetchUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[ProductionEvent]:
-    query: str = f"""
-        SELECT
-            eodl.id_Order,
-            eod.ct_DesignName,
-            eodl.Location,
-            eodl.ColorsTotal,
-            eodl.FlashesTotal,
-            eodl.cn_QtyToProduce,
-            eo.date_OrderRequestedToShip
-        FROM 
-            Events_OrderDesLoc eodl
-        INNER JOIN 
-            Events_Order eo ON eodl.id_Order = eo.ID_Order
-        INNER JOIN
-            Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
-        WHERE
-            eodl.date_Creation >= '01/01/2025'
-            AND eo.date_OrderRequestedToShip >= '{(date.today() - timedelta(days=lookBackRange)).strftime("%m/%d/%Y")}'
-            AND eo.date_OrderRequestedToShip <= '{(date.today() + timedelta(days=lookAheadRange)).strftime("%m/%d/%Y")}'
-            AND eodl.ColorsTotal > 0
-            AND eodl.cn_QtyToProduce > 0
-            AND eo.id_OrderType = 11
-            AND eo.cn_sts_HoldOrder = 0
-            AND eo.sts_ArtDone = 1
-            AND eo.sts_Purchased = 1
-            AND eo.sts_Received = 1
-            AND eo.id_SalesStatus IN (0, 1)
-        ORDER BY
-            eo.date_OrderRequestedToShip ASC
-    """
-    # AND eo.date_OrderRequestedToShip >= '{(date.today() - timedelta(days=lookBackRange)).isoformat()}'
-    #         AND eo.date_OrderRequestedToShip <= '{(date.today() + timedelta(days=lookAheadRange)).isoformat()}'
-
-    try:
-        with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
-            df = qryToDataFrame(cnxn= cnxn, query= query)
-            events: List[ProductionEvent] = []
-            for _, row in df.iterrows():
-                event = ProductionEvent(
-                    orderId=sc(row['id_Order'], int),
-                    orderDesignName=sc(row['ct_DesignName'], str),
-                    printLocation=sc(row['Location'], str),
-                    colorsTotal=sc(row['ColorsTotal'], int, 0),
-                    flashesTotal=sc(row['FlashesTotal'], int, 0),
-                    quantity=sc(row['cn_QtyToProduce'], int, 0),
-                    priority=0,
-                    requestedShipDate=row['date_OrderRequestedToShip']
-                )
-                events.append(event)
-            return events
-    except Exception as e:
-        print(f"Error fetching unscheduled orders: {str(e)}")
-        return []
+def writeUnscheduledOrdersToJson(events: List[ProductionEvent]) -> None:
+    with open("Outputs/unscheduled_orders.json", "w", encoding="utf-8") as f:
+        json.dump([event.to_dict() for event in events], f, indent=4)
 
 def DEBUG_loadUnscheduledOrdersFromJson() -> List[ProductionEvent]:
     try:
@@ -93,11 +46,22 @@ def DEBUG_loadUnscheduledOrdersFromJson() -> List[ProductionEvent]:
         print(f"Error loading unscheduled orders from JSON: {str(e)}")
         return []
 
+# Testing function
+def showValues(orders: List[ProductionEvent], file: str | None = None) -> None:
+    s = sorted(orders, key=lambda e: e.scheduleValue if e.scheduleValue is not None else 0, reverse=True)
+    if file:
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump([event.to_dict() for event in s], f, indent=4)
+    else:
+        for event in s:
+            print(event)
+
 class SchedulingAgent:
     machines: List[Machine]
 
     def __init__(self, machines: List[Machine]):
-        self.machines = machines
+        # sort machines by heads capacity descending
+        self.machines = sorted(machines, key=lambda m: m.heads, reverse=True)
 
     # now that im thinking about it this could just be a parameter in the dataclass but ill leave it here for now
     def calculateScheduleValue(self, event: ProductionEvent) -> int:
@@ -110,31 +74,72 @@ class SchedulingAgent:
         complexityBonus = event.headsTotal * 5  # Arbitrary bonus for more complex jobs
         return event.priority * 100 - daysOut + latenessBonus + complexityBonus
 
-    def evaluateAllEvents(self, events: List[ProductionEvent]) -> None:
+    # Note that this mutates the events list by setting scheduleValue on each event, the return value is just for convenience
+    def evaluateAllEvents(self, events: List[ProductionEvent], sort: bool = True) -> List[ProductionEvent]:
         for event in events:
             event.scheduleValue = self.calculateScheduleValue(event)
+        if sort:
+            events.sort(key=lambda e: e.scheduleValue if e.scheduleValue is not None else 0, reverse=True)
+        return events
 
-    def showValues(self, file: str | None = None) -> None:
-        s = sorted(unscheduledOrders, key=lambda e: e.scheduleValue if e.scheduleValue is not None else 0, reverse=True)
-        if file:
-            with open(file, "w", encoding="utf-8") as f:
-                json.dump([event.to_dict() for event in s], f, indent=4)
-        else:
-            for event in s:
-                print(event)
+    def assignAllMachineSchedules(self, newSchedule: WeekSchedule, save: bool = False) -> None:
+        for machine in self.machines:
+            machine.schedule = newSchedule
+        if save:
+            writeMachinesToJson(self.machines)
 
-    def scheduleEvent(self, event: ProductionEvent) -> None:
-        pass
+    # For scheduling to be optimized they need to be batched together (later implementation for singles will just be a forced insertion)
+    def scheduleEvents(self, events: List[ProductionEvent]) -> List[ProductionEvent]:
+        # Assumes events have been (1) evaluated and (2) sorted by scheduleValue descending
+        # Naive algo goes as so
+        # Cycle through each machine from highest capacity to lowest
+        # Each machine check will do a check top down through values and pick the biggest thing it can fit wthin the top X
+        # (Add some data analysis later to ensure this doesn't prio vortex simple jobs)
+        #
+        # Problems:
+        # Does not consider how long events will take
+        # No hard prio vortex prevention
+        window: int = 10  # how many of the highest value jobs to consider for fitting
+        assignedEvents: List[ProductionEvent] = []
+        while events:
+            if len(events) == 3:
+                log.info("Three events remain: " + ", ".join(str(e) for e in events))
+                break
+            # log.info(f"Scheduling pass, {len(events)} events remaining.")
+            for machine in self.machines:
+                topEvents = events[:window] # Top X events by valu
+                fittingEvents = [e for e in topEvents if e.headsTotal <= machine.heads] # Filter by if they fit
+                fittingEvents.sort(key= lambda e: e.headsTotal, reverse= True) # Sort by heads desc
+                if fittingEvents: # something fits
+                    selectedEvent = fittingEvents[0]
+                    selectedEvent.assignedMachineId = machine.machineId
+                    assignedEvents.append(selectedEvent)
+                    events.remove(selectedEvent)
+                else: # nothing fits, just grab next 
+                    # log.info(f"No fitting events for machine {machine.machineName} (heads: {machine.heads}) in top {window} events.")
+                    for e in topEvents:
+                        if e.headsTotal <= machine.heads:
+                            e.assignedMachineId = machine.machineId
+                            assignedEvents.append(e)
+                            events.remove(e)
+        
+        return assignedEvents
 
 if __name__ == "__main__":
     opStart = perf_counter()
 
+    # writeUnscheduledOrdersToJson(getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 30)) # fetch up to 3 months of orders and write to json for testing
+
+    newSchedule = WeekSchedule(startDate= date.today(), hours= 10)
+
     machines: List[Machine] = fetchMachines() # fetch up static machine data
-    unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson()
+    unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson() # fetch static uunscheduled orders from json
 
     agent = SchedulingAgent(machines)
+    agent.assignAllMachineSchedules(newSchedule)
     agent.evaluateAllEvents(unscheduledOrders)
-
-    agent.showValues('Outputs/sorted_evaluated.json')
+    scheduledOrders = agent.scheduleEvents(unscheduledOrders)
+    
+    showValues(scheduledOrders, 'Outputs/sorted_evaluated.json')
 
     print(f"Execution time: {perf_counter() - opStart:.2f} seconds")

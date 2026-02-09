@@ -1,14 +1,20 @@
 # type: ignore
+import logging
+import os
+import time
+
+import dotenv
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import mplcursors
 import numpy as np
-import scipy.stats
-from DbUtils import getConnection, getCursor, qryToDataFrame
-import logging
 import pandas as pd
-import time
-import os
-import dotenv
+import scipy.stats
+
+from DbUtils import *
+from MyModel import *
+from OtherUtils import *
+from Types import *
 
 dotenv.load_dotenv()
 
@@ -18,6 +24,22 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 plt.style.use('Solarize_Light2')
+
+class Scheduler:
+    # container for Scheduling related reports and analyses
+    def valueDistribution(self) -> None:
+        # distribution of schedule values across all events
+        # fetch up sorted_evaluated.json and plot distribution of scheduleValue
+        pd.read_json('Outputs/sorted_evaluated.json').plot(y='scheduleValue', kind='hist', bins=20, color='cyan', edgecolor='black')
+        plt.title('Distribution of Schedule Values')
+        plt.xlabel('Schedule Value')
+        plt.ylabel('Frequency')
+        plt.grid(axis='y', alpha=0.75)
+        mplcursors.cursor(hover=True)
+        plt.show()
+
+        pass
+
 
 def colors() -> None:
     try:
@@ -54,12 +76,11 @@ def colors() -> None:
             
     except Exception as e:
         log.error(f"Error in colors: {str(e)}")
-    
 
 def main() -> None:
     try:
         with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
-            
+            pass
     except Exception as e:
         log.error(f"Failed to fetch data: {e}")
         raise
@@ -68,6 +89,7 @@ def main() -> None:
 if __name__ == "__main__":
     startTime: float = time.perf_counter()
     # colors()
-    main()
+    # main()
+    Scheduler().valueDistribution()
     endTime: float = time.perf_counter()
     log.info(f"Script Time: {(endTime - startTime):.4f}s")

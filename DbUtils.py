@@ -1,19 +1,20 @@
-from dotenv import load_dotenv
-from pyodbc import Connection, Cursor, Row
-from contextlib import contextmanager
-from typing import Any, Generator, Optional, List, TypedDict, Dict, Callable
-from datetime import datetime
-from pandas import DataFrame
-
-import pyodbc as odbc
-import logging
 import json
+import logging
 import os
-import pandas as pd
-import tempfile
 import subprocess
+import tempfile
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from typing import Any, Callable, Dict, Generator, List, Optional
 
-from ProductionTypes import Machine
+import pandas as pd
+import pyodbc as odbc
+from dotenv import load_dotenv
+from pandas import DataFrame
+from pyodbc import Connection, Cursor, Row
+
+from OtherUtils import safeCast as sc
+from Types import Machine, ProductionEvent, TableProfile
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -23,24 +24,6 @@ load_dotenv()
 PROFILES_PATH: str = os.path.normpath(os.getenv("PROFILES_JSON_PATH", ""))
 CON_STRING: str = os.getenv("DB_CONNECTION_STRING", "")
 DB_LIST: List[str] = json.loads(os.getenv("DB_LIST", "[]"))
-
-class TableProfile(TypedDict):
-    """
-    A TypedDict representing the profile information of a database table.
-
-    Attributes:
-        name (str): The name of the database table.
-        rowCount (int): The total number of rows in the table.
-        columns (List[Dict[str, str]]): A list of dictionaries containing 
-            column information, where each dictionary represents a column with 
-            string keys and string values (e.g., column name, data type, etc.).
-        dateRefreshed (str): The date and time when the table profile was last 
-            refreshed, typically in ISO format or other string representation.
-    """
-    name: str
-    rowCount: int
-    columns: List[Dict[str, str]]
-    dateRefreshed: str
 
 
 def initTableProfile(*, name: str = "", rowCount: int = -1, columns: Optional[List[Dict[str, str]]] = None, dateRefreshed: str = "") -> TableProfile:
@@ -407,8 +390,7 @@ def refreshProfiles() -> bool:
     return False
 
 
-def getMachines() -> List[Machine]:
-    
+def getMachines() -> List[Machine]: 
     with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
         df = qryToDataFrame(cnxn= cnxn, query="""
             SELECT
@@ -421,5 +403,59 @@ def getMachines() -> List[Machine]:
                 ID_Machine IN ('101', '102', '103', '104', '105', '106', '107')
         """)
         machines: List[Machine] = [Machine(machineId= row['ID_Machine'], machineName= row['MachineName'], heads= row['MaxNumberOfColors']) for _, row in df.iterrows()]
-
+        machines.sort(key= lambda m: m.heads, reverse= True)
+        machines[0].heads = 30 # temp hack to fix issues with some orders being bigger than the stryker capacity
     return machines
+
+def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[ProductionEvent]:
+    query: str = f"""
+        SELECT
+            eodl.id_Order,
+            eod.ct_DesignName,
+            eodl.Location,
+            eodl.ColorsTotal,
+            eodl.FlashesTotal,
+            eodl.cn_QtyToProduce,
+            eo.date_OrderRequestedToShip
+        FROM 
+            Events_OrderDesLoc eodl
+        INNER JOIN 
+            Events_Order eo ON eodl.id_Order = eo.ID_Order
+        INNER JOIN
+            Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
+        WHERE
+            eodl.date_Creation >= '01/01/2025'
+            AND eo.date_OrderRequestedToShip >= '{(date.today() - timedelta(days=lookBackRange)).strftime("%m/%d/%Y")}'
+            AND eo.date_OrderRequestedToShip <= '{(date.today() + timedelta(days=lookAheadRange)).strftime("%m/%d/%Y")}'
+            AND eodl.ColorsTotal > 0
+            AND eodl.cn_QtyToProduce > 0
+            AND eo.id_OrderType = 11
+            AND eo.cn_sts_HoldOrder = 0
+            AND eo.sts_ArtDone = 1
+            AND eo.sts_Purchased = 1
+            AND eo.sts_Received = 1
+            AND eo.id_SalesStatus IN (0, 1)
+        ORDER BY
+            eo.date_OrderRequestedToShip ASC
+    """
+
+    try:
+        with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+            df = qryToDataFrame(cnxn= cnxn, query= query)
+            events: List[ProductionEvent] = []
+            for _, row in df.iterrows():
+                event = ProductionEvent(
+                    orderId=sc(row['id_Order'], int),
+                    orderDesignName=sc(row['ct_DesignName'], str),
+                    printLocation=sc(row['Location'], str),
+                    colorsTotal=sc(row['ColorsTotal'], int, 0),
+                    flashesTotal=sc(row['FlashesTotal'], int, 0),
+                    quantity=sc(row['cn_QtyToProduce'], int, 0),
+                    priority=0,
+                    requestedShipDate=row['date_OrderRequestedToShip']
+                )
+                events.append(event)
+            return events
+    except Exception as e:
+        print(f"Error fetching unscheduled orders: {str(e)}")
+        return []
