@@ -19,8 +19,8 @@ def fetchMachines() -> List[Machine]:
     try:
         with open("machines.json", "r", encoding="utf-8") as mf:
             data: List[Machine] = json.load(mf)
-            return [Machine.from_dict(item) for item in data]
-    except Exception as e:
+            return [Machine.from_dict(item) for item in data]  # type: ignore (limitations of Dict based dataclass type hinting)          
+    except:
         machines: List[Machine] = getMachines()
         writeMachinesToJson(machines)
         return machines

@@ -98,12 +98,6 @@ class ProductionEvent:
         event.scheduleValue = data.get("scheduleValue")
         return event
    
-def DEBUG_loadFromJsonFile() -> List[ProductionEvent]:
-    import json
-    with open('unscheduled_events2.json', 'r') as f:
-        data = json.load(f)
-    return [ProductionEvent.from_dict(item) for item in data]
-
 @dataclass
 class Machine():
     # Static attributes retrieved from the database
@@ -140,6 +134,7 @@ class Machine():
                 "sunday": self.schedule.sunday if self.schedule else None
                 }
             }
+    
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> 'Machine':
         schedule_data = data.get("schedule", {})
@@ -162,3 +157,9 @@ class Machine():
             schedule=schedule
          )
         return machine
+
+def DEBUG_loadFromJsonFile() -> List[ProductionEvent]:
+    import json
+    with open('unscheduled_events2.json', 'r') as f:
+        data = json.load(f)
+    return [ProductionEvent.from_dict(item) for item in data]
