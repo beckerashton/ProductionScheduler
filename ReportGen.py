@@ -94,7 +94,7 @@ class Scheduler:
         plt.show()
 
     def moreDetailedModelAnalysis(self) -> None:
-        data = pd.read_json('Outputs/200-6-nolookback-goal4-6hr+30min-received.json')
+        data = pd.read_json('Outputs/t1.json')
         # data = pd.read_json('Outputs/scheduled_orders.json')
         data['requestedShipDate'] = pd.to_datetime(data['requestedShipDate'])
         data['scheduledStartDate'] = pd.to_datetime(data['scheduledStartDate'])
@@ -207,8 +207,8 @@ if __name__ == "__main__":
     # colors()
     # main()
 
-    Scheduler().reqVsShippedDate()
+    # Scheduler().reqVsShippedDate()
     # Scheduler().reqVsShippedDateActual()
-    # Scheduler().moreDetailedModelAnalysis()
+    Scheduler().moreDetailedModelAnalysis()
     endTime: float = time.perf_counter()
     log.info(f"Script Time: {(endTime - startTime):.4f}s")

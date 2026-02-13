@@ -1,6 +1,7 @@
 
 
 import bisect
+import collections
 import json
 import logging
 import math
@@ -170,6 +171,81 @@ class SchedulingAgent:
             machine_calendars[m_idx] = (entries, end_minutes, horizon)
             max_horizon = max(max_horizon, horizon)
 
+        def _order_id_key(event: ProductionEvent) -> str:
+            return str(event.orderId).strip()
+
+        phase1_values = None
+        past_due_events = [event for event in events if event.requestedShipDate < date.today()]
+        if past_due_events:
+            phase1_model = cp_model.CpModel()
+            phase1_start_vars: Dict[Tuple[int, int], cp_model.IntVar] = {}
+            phase1_end_vars: Dict[Tuple[int, int], cp_model.IntVar] = {}
+            phase1_presence_vars: Dict[Tuple[int, int], cp_model.BoolVar] = {}
+            phase1_interval_vars: Dict[Tuple[int, int], cp_model.IntervalVar] = {}
+            phase1_event_end_vars: Dict[int, cp_model.IntVar] = {}
+
+            phase1_machine_intervals: Dict[int, List[cp_model.IntervalVar]] = collections.defaultdict(list)
+
+            machine_ids: List[int] = [machine.machineId for machine in self.machines]
+            machine_index: Dict[int, int] = {mid: idx for idx, mid in enumerate(machine_ids)}
+
+            for i, event in enumerate(past_due_events):
+                duration = self._duration_minutes(event)
+                eligible_machines = [m for m in self.machines if event.headsTotal <= m.heads]
+                if not eligible_machines:
+                    continue
+
+                start_var = phase1_model.NewIntVar(0, max_horizon, f"p1_start_{i}")
+                end_var = phase1_model.NewIntVar(0, max_horizon, f"p1_end_{i}")
+                phase1_event_end_vars[i] = end_var
+
+                presence_list = []
+                for machine in eligible_machines:
+                    m_idx = machine_index[machine.machineId]
+                    _entries, _end_minutes, horizon = machine_calendars[m_idx]
+                    presence = phase1_model.NewBoolVar(f"p1_present_{i}_{m_idx}")
+                    s = phase1_model.NewIntVar(0, horizon, f"p1_s_{i}_{m_idx}")
+                    e = phase1_model.NewIntVar(0, horizon, f"p1_e_{i}_{m_idx}")
+                    interval = phase1_model.NewOptionalIntervalVar(s, duration, e, presence, f"p1_int_{i}_{m_idx}")
+                    phase1_interval_vars[(i, m_idx)] = interval
+                    phase1_start_vars[(i, m_idx)] = s
+                    phase1_end_vars[(i, m_idx)] = e
+                    phase1_presence_vars[(i, m_idx)] = presence
+                    presence_list.append(presence)
+                    phase1_machine_intervals[m_idx].append(interval)
+
+                    phase1_model.Add(start_var == s).OnlyEnforceIf(presence)
+                    phase1_model.Add(end_var == e).OnlyEnforceIf(presence)
+
+                phase1_model.AddExactlyOne(presence_list)
+
+            for m_idx, intervals in phase1_machine_intervals.items():
+                if intervals:
+                    phase1_model.AddNoOverlap(intervals)
+
+            if phase1_event_end_vars:
+                makespan = phase1_model.NewIntVar(0, max_horizon, "p1_makespan")
+                phase1_model.AddMaxEquality(makespan, list(phase1_event_end_vars.values()))
+                phase1_model.Minimize(makespan)
+
+                phase1_solver = cp_model.CpSolver()
+                phase1_solver.parameters.max_time_in_seconds = time_limit_sec
+                phase1_solver.parameters.num_search_workers = 16
+                phase1_result = phase1_solver.Solve(phase1_model)
+
+                if phase1_result in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    phase1_values = {
+                        "start": {},
+                        "end": {},
+                        "presence": {},
+                    }
+                    for (i, m_idx), var in phase1_start_vars.items():
+                        phase1_values["start"][(_order_id_key(past_due_events[i]), m_idx)] = phase1_solver.Value(var)
+                    for (i, m_idx), var in phase1_end_vars.items():
+                        phase1_values["end"][(_order_id_key(past_due_events[i]), m_idx)] = phase1_solver.Value(var)
+                    for (i, m_idx), var in phase1_presence_vars.items():
+                        phase1_values["presence"][(_order_id_key(past_due_events[i]), m_idx)] = phase1_solver.Value(var)
+
         # Initialize CP-SAT model variables
         model = cp_model.CpModel()
         machine_ids: List[int] = [machine.machineId for machine in self.machines]
@@ -228,6 +304,37 @@ class SchedulingAgent:
                 m_idx = machine_index[machine.machineId]
                 model.Add(assigned_machine == m_idx).OnlyEnforceIf(presence_vars[(i, m_idx)])
 
+        if phase1_values:
+            order_id_to_full_index: Dict[str, int] = {}
+            for i, event in enumerate(events):
+                key = _order_id_key(event)
+                if key not in order_id_to_full_index:
+                    order_id_to_full_index[key] = i
+
+            for (order_id, m_idx), value in phase1_values["start"].items():
+                full_index = order_id_to_full_index.get(order_id)
+                if full_index is None:
+                    continue
+                key = (full_index, m_idx)
+                if key in start_vars:
+                    model.AddHint(start_vars[key], value)
+
+            for (order_id, m_idx), value in phase1_values["end"].items():
+                full_index = order_id_to_full_index.get(order_id)
+                if full_index is None:
+                    continue
+                key = (full_index, m_idx)
+                if key in end_vars:
+                    model.AddHint(end_vars[key], value)
+
+            for (order_id, m_idx), value in phase1_values["presence"].items():
+                full_index = order_id_to_full_index.get(order_id)
+                if full_index is None:
+                    continue
+                key = (full_index, m_idx)
+                if key in presence_vars:
+                    model.AddHint(presence_vars[key], value)
+
         for m_idx, _machine in enumerate(self.machines):
             machine_intervals = [
                 interval_vars[key]
@@ -237,15 +344,15 @@ class SchedulingAgent:
             if machine_intervals:
                 model.AddNoOverlap(machine_intervals)
 
-        # Track lateness (days late) for each event
-        for i, event in enumerate(events):
-            # event_end_vars[i] is in minutes, event.requestedShipDate is a datetime
-            due_minutes = int((event.requestedShipDate - events[0].requestedShipDate).total_seconds() // 60)
-            # lateness = max(0, end_time - due_minutes)
-            lateness = model.NewIntVar(0, max_horizon, f"lateness_{i}")
-            model.Add(lateness >= event_end_vars[i] - due_minutes)
-            model.Add(lateness >= 0)
-            lateness_vars[i] = lateness
+        # # Track lateness (days late) for each event
+        # for i, event in enumerate(events):
+        #     # event_end_vars[i] is in minutes, event.requestedShipDate is a datetime
+        #     due_minutes = int((event.requestedShipDate - events[0].requestedShipDate).total_seconds() // 60)
+        #     # lateness = max(0, end_time - due_minutes)
+        #     lateness = model.NewIntVar(0, max_horizon, f"lateness_{i}")
+        #     model.Add(lateness >= event_end_vars[i] - due_minutes)
+        #     model.Add(lateness >= 0)
+        #     lateness_vars[i] = lateness
 
         # Track on-time events (finish by due date)
         on_time_vars: List[cp_model.BoolVar] = []
@@ -305,8 +412,9 @@ class SchedulingAgent:
         model.Maximize(sum(on_time_vars) - 100 * sum(very_late_vars)) # 2
         # model.minimize(sum(lateness_vars[i] * (1000 if very_late_vars[i] else 1) for i in range(len(events)) if i in lateness_vars))
         # model.minimize(sum(lateness_vars[i] for i in range(len(events)) if i in lateness_vars)) # 3
-
+        
         solver = cp_model.CpSolver()
+        # solver.parameters.log_search_progress = True
         solver.parameters.max_time_in_seconds = time_limit_sec
         solver.parameters.num_search_workers = 16
         result = solver.Solve(model)
@@ -417,7 +525,7 @@ class SchedulingAgent:
 if __name__ == "__main__":
     opStart = perf_counter()
 
-    # writeUnscheduledOrdersToJson(getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90)) # fetch up to 3 months of orders and write to json for testing
+    # writeUnscheduledOrdersToJson("Outputs/unscheduled_orders_lookback30.json",getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90)) # fetch up to 3 months of orders and write to json for testing
 
     newSchedule = WeekSchedule(startDate= date.today(), hours= 6)
 
@@ -434,13 +542,31 @@ if __name__ == "__main__":
     # real
     machines: List[Machine] = fetchMachines() # fetch up static machine data
     
-    # unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson("Outputs/unscheduled_orders.json", filterOld= True) # fetch static uunscheduled orders from json
-    unscheduledOrders: List[ProductionEvent] = getUnscheduledOrders(lookBackRange= 0, lookAheadRange= 90) # fetch up to 3 months of orders for testing
+    unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson("Outputs/unscheduled_orders_lookback30.json", filterOld= False) # fetch static uunscheduled orders from json
+    # unscheduledOrders: List[ProductionEvent] = getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90) # fetch up to 3 months of orders for testing
+    import pandas as pd
+    ordersToCheck = pd.read_csv("orders_filter.csv")
+    
+    orders_to_check = (
+        ordersToCheck["orderId"]
+        .astype(str)
+        .str.strip()
+        .dropna()
+        .tolist()
+    )
+    
+    unscheduledOrders = [
+        order for order in unscheduledOrders
+        if str(order.orderId).strip() in orders_to_check
+    ]
+    print(len(unscheduledOrders))
+    
     agent = SchedulingAgent(machines)
     agent.assignAllMachineSchedules(newSchedule, save= True)
     agent.evaluateAllEvents(unscheduledOrders)
     scheduledOrders = agent.scheduleEventsCpSat(unscheduledOrders, time_limit_sec= 120)
-    showValues(scheduledOrders, 'Outputs/200-6-nolookback-goal2-6hr+30min-received.json')
+    # showValues(scheduledOrders, 'Outputs/200-6-nolookback-goal2-6hr+30min-received.json')
+    showValues(scheduledOrders, 'Outputs/t1.json')
 
     # # historical 
     # machines: List[Machine] = fetchMachines()
