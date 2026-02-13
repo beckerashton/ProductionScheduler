@@ -56,7 +56,7 @@ class Scheduler:
         axes[0, 0].grid()
 
         # Second plot: historical_rescheduled2.json
-        data2 = pd.read_json('Outputs/300-3-nolookback-goal2.json')
+        data2 = pd.read_json('Outputs/200-6-nolookback-goal2-6hr+30min-received.json')
         data2['requestedShipDate'] = pd.to_datetime(data2['requestedShipDate'])
         data2['scheduledStartDate'] = pd.to_datetime(data2['scheduledStartDate'])
         data2 = data2.sort_values('requestedShipDate')
@@ -78,12 +78,23 @@ class Scheduler:
         axes[0, 1].set_ylabel('Scheduled Start Date')
         axes[0, 1].grid()
 
+        data4 = pd.read_json('Outputs/200-6-nolookback-goal4-6hr+30min-received.json')
+        data4['requestedShipDate'] = pd.to_datetime(data4['requestedShipDate'])
+        data4['scheduledStartDate'] = pd.to_datetime(data4['scheduledStartDate'])
+        data4 = data4.sort_values('requestedShipDate')
+        axes[1, 1].scatter(data4['requestedShipDate'], data4['scheduledStartDate'], color='cyan')
+        axes[1, 1].plot(data4['requestedShipDate'], data4['requestedShipDate'], color='red', linestyle='--')
+        axes[1, 1].set_title('Goal 4: Maximize On-Time Deliveries with 6hr+30min Setup Time Penalty')
+        axes[1, 1].set_xlabel('Requested Ship Date')
+        axes[1, 1].set_ylabel('Scheduled Start Date')
+        axes[1, 1].grid()
+        
         mplcursors.cursor(hover=True)
         plt.tight_layout()
         plt.show()
 
     def moreDetailedModelAnalysis(self) -> None:
-        data = pd.read_json('Outputs/200-6-nolookback-goal2-6hr+30min-received.json')
+        data = pd.read_json('Outputs/200-6-nolookback-goal4-6hr+30min-received.json')
         # data = pd.read_json('Outputs/scheduled_orders.json')
         data['requestedShipDate'] = pd.to_datetime(data['requestedShipDate'])
         data['scheduledStartDate'] = pd.to_datetime(data['scheduledStartDate'])
@@ -91,7 +102,7 @@ class Scheduler:
         # plot scheduledStartDate vs requestedShipDate colored by machineId
         plt.scatter(data['requestedShipDate'], data['scheduledStartDate'], c=data['assignedMachineId'], cmap='tab10')
         plt.plot(data['requestedShipDate'], data['requestedShipDate'], color='red', linestyle='--')
-        plt.title('Goal 2: Maximize On-Time Deliveries with Heavy Penalty for Very Late')
+        plt.title('Goal 4: Maximize On-Time Deliveries with 6hr+30min Setup Time Penalty')
         plt.xlabel('Requested Ship Date')
         plt.ylabel('Scheduled Start Date')
         # add legend for machineId colors
@@ -196,8 +207,8 @@ if __name__ == "__main__":
     # colors()
     # main()
 
-    # Scheduler().reqVsShippedDate()
+    Scheduler().reqVsShippedDate()
     # Scheduler().reqVsShippedDateActual()
-    Scheduler().moreDetailedModelAnalysis()
+    # Scheduler().moreDetailedModelAnalysis()
     endTime: float = time.perf_counter()
     log.info(f"Script Time: {(endTime - startTime):.4f}s")

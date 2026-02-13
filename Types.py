@@ -38,6 +38,7 @@ class ProductionEvent:
     # Static attributes retrieved from the database
     orderId: int
     orderDesignName: str
+    designId: str
     printLocation: str
     colorsTotal: int
     flashesTotal: int
@@ -54,9 +55,10 @@ class ProductionEvent:
     def headsTotal(self) -> int:
         return self.colorsTotal + 2 * self.flashesTotal
 
-    def __init__(self, orderId: int, orderDesignName: str, printLocation: str, colorsTotal: int, flashesTotal: int, quantity: int, priority: int, requestedShipDate: date):
+    def __init__(self, orderId: int, orderDesignName: str, designId: str, printLocation: str, colorsTotal: int, flashesTotal: int, quantity: int, priority: int, requestedShipDate: date):
         self.orderId = orderId
         self.orderDesignName = orderDesignName
+        self.designId = designId
         self.printLocation = printLocation
         self.colorsTotal = colorsTotal
         self.flashesTotal = flashesTotal
@@ -65,12 +67,13 @@ class ProductionEvent:
         self.requestedShipDate = requestedShipDate
     
     def __str__(self):
-        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId}, estTime={self.estTime})"
+        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', designId={self.designId}, printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId}, estTime={self.estTime})"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "orderId": self.orderId,
             "orderDesignName": self.orderDesignName,
+            "designId": self.designId,
             "printLocation": self.printLocation,
             "colorsTotal": self.colorsTotal,
             "flashesTotal": self.flashesTotal,
@@ -88,6 +91,7 @@ class ProductionEvent:
         event = ProductionEvent(
             orderId=data["orderId"],
             orderDesignName=data["orderDesignName"],
+            designId=data["designId"],
             printLocation=data["printLocation"],
             colorsTotal=data["colorsTotal"],
             flashesTotal=data["flashesTotal"],

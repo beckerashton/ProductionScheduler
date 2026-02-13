@@ -412,6 +412,7 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
         SELECT
             eodl.id_Order,
             eod.ct_DesignName,
+            eod.id_Design,
             eodl.Location,
             eodl.ColorsTotal,
             eodl.FlashesTotal,
@@ -447,6 +448,7 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
                 event = ProductionEvent(
                     orderId=sc(row['id_Order'], int),
                     orderDesignName=sc(row['ct_DesignName'], str),
+                    designId=sc(row['id_Design'], str),
                     printLocation=sc(row['Location'], str),
                     colorsTotal=sc(row['ColorsTotal'], int, 0),
                     flashesTotal=sc(row['FlashesTotal'], int, 0),
@@ -465,7 +467,8 @@ def getHistoricalScheduledOrders(minDate: date = date(2025, 1, 1), maxDate: date
         SELECT
             eodl.id_Order,
             eod.ct_DesignName,
-            eodl.Location,
+            eod.id_Design,
+            eodl.Location,  
             eodl.ColorsTotal,
             eodl.FlashesTotal,
             eodl.cn_QtyToProduce,
@@ -496,6 +499,7 @@ def getHistoricalScheduledOrders(minDate: date = date(2025, 1, 1), maxDate: date
                 event = ProductionEvent(
                     orderId=sc(row['id_Order'], int),
                     orderDesignName=sc(row['ct_DesignName'], str),
+                    designId=sc(row['id_Design'], str),
                     printLocation=sc(row['Location'], str),
                     colorsTotal=sc(row['ColorsTotal'], int, 0),
                     flashesTotal=sc(row['FlashesTotal'], int, 0),
