@@ -433,12 +433,12 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
             AND eo.cn_sts_HoldOrder = 0
             AND eo.sts_ArtDone = 1
             AND eo.sts_Purchased = 1
-            AND eo.sts_Received = 1
+            
             AND eo.id_SalesStatus IN (0, 1)
         ORDER BY
             eo.date_OrderRequestedToShip ASC
     """
-
+    # AND eo.sts_Received = 1
     try:
         with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
             df = qryToDataFrame(cnxn= cnxn, query= query)
@@ -460,7 +460,7 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
         print(f"Error fetching unscheduled orders: {str(e)}")
         return []
 
-def getHistoricalScheduledOrders() -> List[ProductionEvent]:
+def getHistoricalScheduledOrders(minDate: date = date(2025, 1, 1), maxDate: date = date(2026, 1, 1)) -> List[ProductionEvent]:
     query: str = f"""
         SELECT
             eodl.id_Order,
@@ -477,9 +477,9 @@ def getHistoricalScheduledOrders() -> List[ProductionEvent]:
         INNER JOIN
             Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
         WHERE
-            eodl.date_Creation >= '06/01/2024'
-            AND eo.date_OrderRequestedToShip >= '01/01/2025'
-            AND eo.date_OrderRequestedToShip <= '01/01/2026'
+            eodl.date_Creation >= '{minDate.strftime("%m/%d/%Y")}'
+            AND eo.date_OrderRequestedToShip >= '{minDate.strftime("%m/%d/%Y")}'
+            AND eo.date_OrderRequestedToShip <= '{maxDate.strftime("%m/%d/%Y")}'
             AND eodl.ColorsTotal > 0
             AND eodl.cn_QtyToProduce > 0
             AND eo.id_OrderType = 11
@@ -508,3 +508,4 @@ def getHistoricalScheduledOrders() -> List[ProductionEvent]:
     except Exception as e:
         print(f"Error fetching historical scheduled orders: {str(e)}")
         return []
+    

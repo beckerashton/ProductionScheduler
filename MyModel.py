@@ -35,15 +35,21 @@ def writeMachinesToJson(machines: List[Machine]) -> None:
     with open("Outputs/machines.json", "w", encoding="utf-8") as mf:
         json.dump([machine.to_dict() for machine in machines], mf, indent=4)
 
-def writeUnscheduledOrdersToJson(events: List[ProductionEvent]) -> None:
-    with open("Outputs/unscheduled_orders.json", "w", encoding="utf-8") as f:
+def writeUnscheduledOrdersToJson(file: str, events: List[ProductionEvent]) -> None:
+    with open(file, "w", encoding="utf-8") as f:
         json.dump([event.to_dict() for event in events], f, indent=4)
 
-def DEBUG_loadUnscheduledOrdersFromJson() -> List[ProductionEvent]:
+def DEBUG_loadUnscheduledOrdersFromJson(file: str, filterOld: bool = False) -> List[ProductionEvent]:
     try:
-        with open('Outputs/unscheduled_orders.json', "r", encoding="utf-8") as f:
+        import pandas as pd
+        with open(file, "r", encoding="utf-8") as f:
+            # return [ProductionEvent.from_dict(item) for item in json.load(f)] where if filterOld is true we filter out events with requestedShipDate in the past
             data = json.load(f)
-            return [ProductionEvent.from_dict(item) for item in data]
+            events = [ProductionEvent.from_dict(item) for item in data]
+            if filterOld:
+                today = date.today()
+                events = [event for event in events if event.requestedShipDate >= today]
+            return events
     except Exception as e:
         print(f"Error loading unscheduled orders from JSON: {str(e)}")
         return []
@@ -91,7 +97,7 @@ class SchedulingAgent:
             writeMachinesToJson(self.machines)
 
     def _duration_minutes(self, event: ProductionEvent) -> int:
-        hours = event.quantity / 300 + event.headsTotal / 6
+        hours = event.quantity / 200 + event.headsTotal / 6 + 0.5
         return max(1, math.ceil(hours * 60))
 
     def _get_machine_schedule(self, machine: Machine) -> WeekSchedule:
@@ -177,6 +183,7 @@ class SchedulingAgent:
         event_end_vars: Dict[int, cp_model.IntVar] = {}
         event_start_vars: Dict[int, cp_model.IntVar] = {}
         assigned_machine_vars: Dict[int, cp_model.IntVar] = {}
+        lateness_vars: Dict[int, cp_model.IntVar] = {}
 
         # 
         for i, event in enumerate(events):
@@ -230,6 +237,16 @@ class SchedulingAgent:
             if machine_intervals:
                 model.AddNoOverlap(machine_intervals)
 
+        # Track lateness (days late) for each event
+        for i, event in enumerate(events):
+            # event_end_vars[i] is in minutes, event.requestedShipDate is a datetime
+            due_minutes = int((event.requestedShipDate - events[0].requestedShipDate).total_seconds() // 60)
+            # lateness = max(0, end_time - due_minutes)
+            lateness = model.NewIntVar(0, max_horizon, f"lateness_{i}")
+            model.Add(lateness >= event_end_vars[i] - due_minutes)
+            model.Add(lateness >= 0)
+            lateness_vars[i] = lateness
+
         # Track on-time events (finish by due date)
         on_time_vars: List[cp_model.BoolVar] = []
         for i, event in enumerate(events):
@@ -281,8 +298,13 @@ class SchedulingAgent:
                 model.Add(very_late == 0)
             very_late_vars.append(very_late)
 
+        
+
         # Multi-objective: maximize on-time deliveries and heavily penalize very late events
-        model.Maximize(sum(on_time_vars) - 10 * sum(very_late_vars))
+        # model.Maximize(sum(on_time_vars)) # 1
+        model.Maximize(sum(on_time_vars) - 100 * sum(very_late_vars)) # 2
+        # model.minimize(sum(lateness_vars[i] * (1000 if very_late_vars[i] else 1) for i in range(len(events)) if i in lateness_vars))
+        # model.minimize(sum(lateness_vars[i] for i in range(len(events)) if i in lateness_vars)) # 3
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_sec
@@ -381,7 +403,7 @@ class SchedulingAgent:
         
         try:
             # Schedule using the historical context
-            scheduled_events = self.scheduleEventsCpSat(events, time_limit_sec=1200)
+            scheduled_events = self.scheduleEventsCpSat(events, time_limit_sec=30)
         except Exception as e:
             log.error(f"Error during historical scheduling: {str(e)}")
             scheduled_events = []
@@ -395,9 +417,9 @@ class SchedulingAgent:
 if __name__ == "__main__":
     opStart = perf_counter()
 
-    # writeUnscheduledOrdersToJson(getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 30)) # fetch up to 3 months of orders and write to json for testing
+    # writeUnscheduledOrdersToJson(getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90)) # fetch up to 3 months of orders and write to json for testing
 
-    # newSchedule = WeekSchedule(startDate= date.today(), hours= 10)
+    newSchedule = WeekSchedule(startDate= date.today(), hours= 6)
 
     # machines: List[Machine] = fetchMachines() # fetch up static machine data
     # unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson() # fetch static uunscheduled orders from json
@@ -410,28 +432,31 @@ if __name__ == "__main__":
     # showValues(scheduledOrders, 'Outputs/sorted_evaluated.json')
 
     # real
-    # machines: List[Machine] = fetchMachines() # fetch up static machine data
-    # # unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson() # fetch static uunscheduled orders from json
-    # unscheduledOrders: List[ProductionEvent] = getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90) # fetch up to 3 months of orders for testing
-    # agent = SchedulingAgent(machines)
-    # agent.evaluateAllEvents(unscheduledOrders)
-    # scheduledOrders = agent.scheduleEventsCpSat(unscheduledOrders, time_limit_sec= 30)
-    # showValues(scheduledOrders, 'Outputs/scheduled_orders.json')
-
-    # historical 
-    machines: List[Machine] = fetchMachines()
-    historical_orders: List[ProductionEvent] = getHistoricalScheduledOrders()
-    # print(len(historical_orders))
-    agent = SchedulingAgent(machines)
-    agent.evaluateAllEvents(historical_orders)
+    machines: List[Machine] = fetchMachines() # fetch up static machine data
     
-    # Re-schedule historical orders in their original context
-    rescheduled_orders = agent.scheduleEventsHistorical(historical_orders)
-    print(f"Rescheduled {len(rescheduled_orders)} historical orders")
-    # write to json
-    with open('Outputs/historical_rescheduled.json', 'w', encoding='utf-8') as f:
-        json.dump([event.to_dict() for event in rescheduled_orders], f, indent=4)
-    # Compare scheduled vs actual results
-    # showValues(rescheduled_orders, 'Outputs/historical_validation.json')
+    # unscheduledOrders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson("Outputs/unscheduled_orders.json", filterOld= True) # fetch static uunscheduled orders from json
+    unscheduledOrders: List[ProductionEvent] = getUnscheduledOrders(lookBackRange= 0, lookAheadRange= 90) # fetch up to 3 months of orders for testing
+    agent = SchedulingAgent(machines)
+    agent.assignAllMachineSchedules(newSchedule, save= True)
+    agent.evaluateAllEvents(unscheduledOrders)
+    scheduledOrders = agent.scheduleEventsCpSat(unscheduledOrders, time_limit_sec= 120)
+    showValues(scheduledOrders, 'Outputs/200-6-nolookback-goal2-6hr+30min-received.json')
+
+    # # historical 
+    # machines: List[Machine] = fetchMachines()
+    # # writeUnscheduledOrdersToJson("Outputs/historical_preschedule.json", getHistoricalScheduledOrders(minDate= date(2025, 9, 1), maxDate= date(2026, 1, 10))) # fetch past 3 months of orders and write to json for testing
+    # historical_orders: List[ProductionEvent] = DEBUG_loadUnscheduledOrdersFromJson("Outputs/historical_preschedule.json") # load from json for testing
+    # # historical_orders: List[ProductionEvent] = getHistoricalScheduledOrders(minDate= date(2025, 9, 1), maxDate= date(2026, 1, 10))
+    # agent = SchedulingAgent(machines)
+    # agent.evaluateAllEvents(historical_orders)
+    
+    # # Re-schedule historical orders in their original context
+    # rescheduled_orders = agent.scheduleEventsHistorical(historical_orders)
+    # print(f"Rescheduled {len(rescheduled_orders)} historical orders")
+    # # write to json
+    # with open('Outputs/historical_rescheduled2.json', 'w', encoding='utf-8') as f:
+    #     json.dump([event.to_dict() for event in rescheduled_orders], f, indent=4)
+    # # Compare scheduled vs actual results
+    # # showValues(rescheduled_orders, 'Outputs/historical_validation.json')
 
     print(f"Execution time: {perf_counter() - opStart:.2f} seconds")

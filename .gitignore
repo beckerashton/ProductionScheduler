@@ -9,5 +9,4 @@ test_output.xlsx
 upcoming_orders_colors_total.csv
 machines.json
 unscheduled_events.json
-Outputs/sorted_evaluated.json
-Outputs/unscheduled_orders.json
+Outputs/
