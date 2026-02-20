@@ -34,6 +34,14 @@ class WeekSchedule:
         self.sunday = sunday
 
 @dataclass
+class DummyEvent:
+    orderId: int
+    designId: str
+    estTime: int
+    requestedShipDate: date
+    complexity: int
+
+@dataclass
 class ProductionEvent:
     # Static attributes retrieved from the database
     orderId: int
