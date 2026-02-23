@@ -407,6 +407,52 @@ def getMachines() -> List[Machine]:
         machines[0].heads = 30 # temp hack to fix issues with some orders being bigger than the stryker capacity
     return machines
 
+def getProducedOrders(minDate: date = date(2025, 1, 1), maxDate: date = date(2026, 1, 1)) -> List[ProductionEvent]:
+    qry: str = f"""
+        SELECT
+            eodl.id_Order,
+            eod.ct_DesignName,
+            eod.id_Design,
+            eodl.Location,
+            eodl.ColorsTotal,
+            eodl.FlashesTotal,
+            eodl.cn_QtyToProduce,
+            eo.date_OrderRequestedToShip,
+            eo.date_ProductionDone
+        FROM
+            Events_Order eo
+        INNER JOIN
+            Events_OrderDesLoc eodl ON eo.id_Order = eodl.id_Order
+        INNER JOIN
+            Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
+        WHERE
+            eo.sts_Produced = 1
+            AND eo.date_ProductionDone >= '{minDate.strftime("%m/%d/%Y")}'
+            AND eo.date_ProductionDone <= '{maxDate.strftime("%m/%d/%Y")}'
+            AND eodl.ColorsTotal > 0
+            AND eodl.cn_QtyToProduce > 0
+            AND eo.id_OrderType = 11
+    """
+
+    with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+        df = qryToDataFrame(cnxn= cnxn, query= qry)
+        events: List[ProductionEvent] = []
+        for _, row in df.iterrows():
+            event = ProductionEvent(
+                orderId=sc(row['id_Order'], int),
+                orderDesignName=sc(row['ct_DesignName'], str),
+                designId=sc(row['id_Design'], str),
+                printLocation=sc(row['Location'], str),
+                colorsTotal=sc(row['ColorsTotal'], int, 0),
+                flashesTotal=sc(row['FlashesTotal'], int, 0),
+                quantity=sc(row['cn_QtyToProduce'], int, 0),
+                priority=0,
+                requestedShipDate=row['date_OrderRequestedToShip'],
+                productionDoneDate=row['date_ProductionDone']
+            )
+            events.append(event)
+        return events
+
 def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[ProductionEvent]:
     query: str = f"""
         SELECT
@@ -513,3 +559,40 @@ def getHistoricalScheduledOrders(minDate: date = date(2025, 1, 1), maxDate: date
         print(f"Error fetching historical scheduled orders: {str(e)}")
         return []
     
+def getOrdersFromList(orderIds: List[int | str]) -> DataFrame:
+    if not orderIds:
+        return []
+    
+    idsString: str = ", ".join(str(oid) for oid in orderIds)
+    query: str = f"""
+        SELECT
+            eodl.id_Order,
+            eod.ct_DesignName,
+            eod.id_Design,
+            eodl.Location,  
+            eodl.ColorsTotal,
+            eodl.FlashesTotal,
+            eodl.cn_QtyToProduce,
+            eo.date_OrderRequestedToShip
+        FROM 
+            Events_OrderDesLoc eodl
+        INNER JOIN 
+            Events_Order eo ON eodl.id_Order = eo.ID_Order
+        INNER JOIN
+            Events_OrderDes eod ON eodl.id_Order = eod.id_Order AND eod.id_DesignType = 1
+        WHERE
+            eodl.id_Order IN ({idsString})
+            AND eodl.ColorsTotal > 0
+            AND eodl.cn_QtyToProduce > 0
+            AND eo.id_OrderType = 11
+        ORDER BY
+            eo.date_OrderRequestedToShip ASC
+    """
+
+    try:
+        with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+            df = qryToDataFrame(cnxn= cnxn, query= query)
+            return df
+    except Exception as e:
+        print(f"Error fetching orders from list: {str(e)}")
+        return []

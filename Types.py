@@ -41,6 +41,21 @@ class DummyEvent:
     requestedShipDate: date
     complexity: int
 
+    @staticmethod
+    def complexityFromColorCount(colors: int) -> int:
+        if colors <= 6:
+            return 0
+        elif colors <= 8:
+            return 1
+        elif colors <= 12:
+            return 2
+        else:
+            return 3
+    
+    @staticmethod
+    def estTimeFromQuantityAndColorsInMinutes(quantity: int, colors: int) -> int:
+        return int(((quantity / 450) * 60) + (colors * 10))
+
 @dataclass
 class ProductionEvent:
     # Static attributes retrieved from the database
@@ -53,6 +68,7 @@ class ProductionEvent:
     quantity: int
     priority: int
     requestedShipDate: date
+    productionDoneDate: Optional[date] = None
 
     # Calculated / derived attributes
     scheduleValue: Optional[int] = None # Experimental value for scheduling priority
@@ -63,7 +79,7 @@ class ProductionEvent:
     def headsTotal(self) -> int:
         return self.colorsTotal + 2 * self.flashesTotal
 
-    def __init__(self, orderId: int, orderDesignName: str, designId: str, printLocation: str, colorsTotal: int, flashesTotal: int, quantity: int, priority: int, requestedShipDate: date):
+    def __init__(self, orderId: int, orderDesignName: str, designId: str, printLocation: str, colorsTotal: int, flashesTotal: int, quantity: int, priority: int, requestedShipDate: date, productionDoneDate: Optional[date] = None):
         self.orderId = orderId
         self.orderDesignName = orderDesignName
         self.designId = designId
@@ -73,9 +89,9 @@ class ProductionEvent:
         self.quantity = quantity
         self.priority = priority
         self.requestedShipDate = requestedShipDate
-    
+        self.productionDoneDate = productionDoneDate
     def __str__(self):
-        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', designId={self.designId}, printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId}, estTime={self.estTime})"
+        return f"ProductionEvent(orderId={self.orderId}, orderDesignName='{self.orderDesignName}', designId={self.designId}, printLocation='{self.printLocation}', colorsTotal={self.colorsTotal}, flashesTotal={self.flashesTotal}, quantity={self.quantity}, priority={self.priority}, requestedShipDate={self.requestedShipDate}, productionDoneDate={self.productionDoneDate}, scheduleValue={self.scheduleValue}, scheduledStartDate={self.scheduledStartDate}, assignedMachineId={self.assignedMachineId}, estTime={self.estTime})"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -91,7 +107,8 @@ class ProductionEvent:
             "scheduleValue": self.scheduleValue,
             "scheduledStartDate": self.scheduledStartDate.isoformat() if self.scheduledStartDate else None,
             "assignedMachineId": self.assignedMachineId,
-            "estTime": self.estTime
+            "estTime": self.estTime,
+            "productionDoneDate": self.productionDoneDate.isoformat() if self.productionDoneDate else None
         }
 
     @staticmethod
@@ -105,14 +122,16 @@ class ProductionEvent:
             flashesTotal=data["flashesTotal"],
             quantity=data["quantity"],
             priority=data["priority"],
-            requestedShipDate=date.fromisoformat(data["requestedShipDate"])
+            requestedShipDate=date.fromisoformat(data["requestedShipDate"]),
+            productionDoneDate=date.fromisoformat(data["productionDoneDate"]) if data.get("productionDoneDate") else None
         )
         if data.get("scheduledStartDate"):
             event.scheduledStartDate = date.fromisoformat(data["scheduledStartDate"])
         event.assignedMachineId = data.get("assignedMachineId")
         event.scheduleValue = data.get("scheduleValue")
         event.estTime = data.get("estTime")
-        return event
+        if data.get("productionDoneDate"):
+            event.productionDoneDate = date.fromisoformat(data["productionDoneDate"])
    
 @dataclass
 class Machine():

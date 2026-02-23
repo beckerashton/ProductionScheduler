@@ -5,11 +5,19 @@ import re
 import stat
 from matplotlib.pylab import f
 import matplotlib.pyplot as plt
+from datetime import date
 import numpy as np
 from ortools.sat.python import cp_model
 from pydantic import BaseModel, Field, PositiveInt, NonNegativeFloat, model_validator
 
 from Types import DummyEvent
+
+# Util func to convert date to int for cpsat model relative to a fixed start date
+# needed for compatibility with cp models constraints
+def _date_to_int(this_date: date | str, start_date: date = date(2025, 1, 1)) -> int:
+    if isinstance(this_date, str):
+        this_date = date.fromisoformat(this_date)
+    return (this_date - start_date).days
 
 # Container for the inputs to a scheduler instance
 class SchedulerInstance(BaseModel):
@@ -24,6 +32,13 @@ class SchedulerInstance(BaseModel):
         if "machines" not in data or not isinstance(data["machines"], list):
             raise ValueError("Input must contain a list of machines.")
         return data
+
+    @model_validator(mode="after")
+    def reformat_events_dates(self):
+        for event in self.events:
+            if isinstance(event.requestedShipDate, str) or isinstance(event.requestedShipDate, date):
+                event.requestedShipDate = _date_to_int(event.requestedShipDate)
+        return self
 
 # Container for the configs of a scheduler instance
 class SchedulerSolverConfig(BaseModel):
@@ -265,36 +280,50 @@ def gtest():
     #     DummyEvent(10, 5, 5, 18, 0)
     # ]
 
-    from random import randint, seed, normalvariate
-    seed(12)
-    events = []
-    dc = [0] * 15 + [1] * 21 + [2] * 31 + [3] * 11 + [4] * 12
-    for _ in range(1000):
-        orderId = len(events) + 1
-        designId = randint(0, 199)
-        estTime = randint(1, 20)
-        requestedShipDate = randint(1, 100)
-        complexity = dc[designId % len(dc)]
-        events.append(DummyEvent(orderId, designId, estTime, requestedShipDate, complexity))
+    # from random import randint, seed
+    # seed(12)
+    # events = []
+    # # dc = [0] * 18 + [1] * 24 + [2] * 34 + [3] * 14 # fake
+    # normalizer = float(100 / (2466 + 430 + 1258 + 297))
+    # dc = [0] * int(2466*normalizer) + [1] * int(430*normalizer) + [2] * int(1258*normalizer) + [3] * int(297*normalizer)
+    # print(dc.count(0), dc.count(1), dc.count(2), dc.count(3))
+    # for _ in range(1000):
+    #     orderId = len(events) + 1
+    #     designId = randint(0, 199)
+    #     estTime = randint(1, 20)
+    #     requestedShipDate = randint(1, 100)
+    #     complexity = dc[designId % len(dc)]
+    #     events.append(DummyEvent(orderId, designId, estTime, requestedShipDate, complexity))
 
+    import pandas as pd
+    df = pd.read_csv('filtered_orders.csv')
+
+    df["estTime"] = df.apply(lambda row: DummyEvent.estTimeFromQuantityAndColorsInMinutes(row["cn_QtyToProduce"], row["ColorsTotal"]), axis=1)
+    df["complexity"] = df.apply(lambda row: DummyEvent.complexityFromColorCount(row["ColorsTotal"]), axis=1)
+    df["designId"] = df["id_Design"].apply(lambda x: int(float(x)))
+    
+    events = [DummyEvent(row["id_Order"], row["designId"], row["estTime"], row["date_OrderRequestedToShip"], row["complexity"]) for _, row in df.iterrows()]
+
+    # quit()
     events_grouped = collections.defaultdict(lambda: {"estTime": 0, "requestedShipDate": 0, "complexity": 0})
     for event in events:
         if event.designId not in events_grouped:
             events_grouped[event.designId] = {"estTime": event.estTime, "requestedShipDate": event.requestedShipDate, "complexity": event.complexity}
         else:
             events_grouped[event.designId]["estTime"] += event.estTime
-            events_grouped[event.designId]["requestedShipDate"] = max(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate)
-    
+            events_grouped[event.designId]["requestedShipDate"] = min(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate)
+            events_grouped[event.designId]["complexity"] = max(events_grouped[event.designId]["complexity"], event.complexity)
+
     print(f"Complexity distribution: {collections.Counter(e.complexity for e in events)}")
 
     machines = [
-        {"id": 1, "capability": 0},
+        {"id": 1, "capability": 2},
         {"id": 2, "capability": 1},
-        {"id": 3, "capability": 1},
+        {"id": 3, "capability": 2},
         {"id": 4, "capability": 2},
-        {"id": 5, "capability": 2},
+        {"id": 5, "capability": 0},
         {"id": 6, "capability": 3},
-        {"id": 7, "capability": 4},
+        {"id": 7, "capability": 0},
     ]
 
     instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(events_grouped.items())],
@@ -304,8 +333,10 @@ def gtest():
     
     solver = SchedulerSolver(instance, config)
     solver._set_balanced_objective()
-    solver._add_constraint_no_gap_between_events()
-
+    # solver._add_constraint_no_gap_between_events()
+    for event in instance.events:
+        print(f"Event {event.orderId}: estTime={event.estTime}, requestedShipDate={event.requestedShipDate}, complexity={event.complexity}")
+        break
     solution = solver.solve(time_limit=30)
     print(f"Solution status: {solution.status}")
     # print(f"Solution status: {solution.status}, Objective value: {solution.objective_value}, Schedule: {solution.schedule}")
