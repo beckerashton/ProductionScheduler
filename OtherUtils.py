@@ -130,7 +130,12 @@ def safeCast(val: Any, toType: type, default: Any = None) -> Any:
         return default
 
 
-
+def tempShow(data: Any) -> None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            print(f"{key}: {value}")
+    else:
+        print(data)
 
 
 

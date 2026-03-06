@@ -54,7 +54,7 @@ class DummyEvent:
     
     @staticmethod
     def estTimeFromQuantityAndColorsInMinutes(quantity: int, colors: int) -> int:
-        return int(((quantity / 450) * 60) + (colors * 10))
+        return int(((quantity / 250) * 60) + (colors * 10))
 
 @dataclass
 class ProductionEvent:

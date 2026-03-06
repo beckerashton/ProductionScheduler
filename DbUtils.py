@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 load_dotenv()
 
 PROFILES_PATH: str = os.path.normpath(os.getenv("PROFILES_JSON_PATH", ""))
+INPUT_PATH: str = os.path.normpath(os.getenv("INPUT_PATH", ""))
 CON_STRING: str = os.getenv("DB_CONNECTION_STRING", "")
 DB_LIST: List[str] = json.loads(os.getenv("DB_LIST", "[]"))
 
@@ -453,7 +454,7 @@ def getProducedOrders(minDate: date = date(2025, 1, 1), maxDate: date = date(202
             events.append(event)
         return events
 
-def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[ProductionEvent]:
+def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int, saveToCsv: str = None) -> List[ProductionEvent]:
     query: str = f"""
         SELECT
             eodl.id_Order,
@@ -503,6 +504,8 @@ def getUnscheduledOrders(lookBackRange: int, lookAheadRange: int) -> List[Produc
                     requestedShipDate=row['date_OrderRequestedToShip']
                 )
                 events.append(event)
+            if saveToCsv:
+                df.to_csv(saveToCsv, index= False)
             return events
     except Exception as e:
         print(f"Error fetching unscheduled orders: {str(e)}")
@@ -596,3 +599,10 @@ def getOrdersFromList(orderIds: List[int | str]) -> DataFrame:
     except Exception as e:
         print(f"Error fetching orders from list: {str(e)}")
         return []
+    
+def refresh() -> None:
+    dirPath = os.path.dirname(INPUT_PATH)
+    extPath = os.path.join(dirPath, f"unscheduled_{date.today().strftime('%m_%d_%y')}.csv")
+
+    getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90, saveToCsv= extPath)
+    
