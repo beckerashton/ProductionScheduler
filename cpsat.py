@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, PositiveInt, NonNegativeFloat, model_vali
 
 from OtherUtils import tempShow
 from Types import DummyEvent
-from DbUtils import refresh 
+from DbUtils import peek, refresh 
 
 # Util func to convert date to int for cpsat model relative to a fixed start date
 # needed for compatibility with cp models constraints
@@ -380,26 +380,36 @@ def gtest():
     #     events.append(DummyEvent(orderId, designId, estTime, requestedShipDate, complexity))
 
     import pandas as pd
-    df = pd.read_csv('Inputs/unscheduled_03_06_26.csv')
+    # df = pd.read_csv('Inputs/unscheduled_03_06_26.csv')
     # df = pd.read_csv('Inputs/copy.csv')
-
+    # input_df = pd.read_excel("C:/Users/Aston/Documents/Production Scheduler Demo.xlsx", sheet_name="Sheet3", header=2, engine="openpyxl", usecols="C,E,M,P,V")
+    input_df = pd.read_excel("C:/Users/Aston/Documents/Production Scheduler Demo.xlsx", nrows=500, sheet_name="Sheet3", header=1, usecols="B,C,E,M,P,U,V")
+    input_df = input_df[input_df["Week_Sch"] == 11]
+    
+    df = input_df.rename(columns={"Order No": "id_Order", "Design No": "id_Design", "Location": "Location", "DueDate": "date_OrderRequestedToShip", "Imp": "cn_QtyToProduce", "No_Colors": "ColorsTotal"})
+    df = df.dropna(subset=["id_Order", "id_Design", "Location", "date_OrderRequestedToShip", "cn_QtyToProduce", "ColorsTotal"])
+    
     df["estTime"] = df.apply(lambda row: DummyEvent.estTimeFromQuantityAndColorsInMinutes(row["cn_QtyToProduce"], row["ColorsTotal"]), axis=1)
     df["complexity"] = df.apply(lambda row: DummyEvent.complexityFromColorCount(row["ColorsTotal"]), axis=1)
     df["designId"] = df.apply(lambda row: f"{int(row['id_Design'])}_{row['Location']}", axis=1)
-    
-    events = [DummyEvent(row["id_Order"], row["designId"], row["estTime"], row["date_OrderRequestedToShip"], row["complexity"]) for _, row in df.iterrows()]
+    df["date_OrderRequestedToShip"] = df["date_OrderRequestedToShip"].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else date.fromisoformat(x) if isinstance(x, str) else x)
+    df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
 
+    events = [DummyEvent(row["id_Order"], row["designId"], row["estTime"], row["setupTime"], row["date_OrderRequestedToShip"], row["complexity"]) for _, row in df.iterrows()]
+    
     events_grouped = collections.defaultdict(lambda: {"estTime": 0, "requestedShipDate": 0, "complexity": 0})
     for event in events:
         if event.designId not in events_grouped:
             events_grouped[event.designId] = {"estTime": event.estTime, "requestedShipDate": event.requestedShipDate, "complexity": event.complexity}
         else:
-            events_grouped[event.designId]["estTime"] += event.estTime
+            events_grouped[event.designId]["estTime"] += event.estTime - event.setupTime
             events_grouped[event.designId]["requestedShipDate"] = min(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate)
             events_grouped[event.designId]["complexity"] = max(events_grouped[event.designId]["complexity"], event.complexity)
+    
+    
     max_presolve_window_days = 7
     for i in range(7, max_presolve_window_days + 1, 1):
-        late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=i)}
+        # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=i)}
         print(f"Complexity distribution: {collections.Counter(e.complexity for e in events)}")
 
         machines = [
@@ -413,18 +423,18 @@ def gtest():
         ]
 
         # pre solve with tighter constraints on late events to use for a min solve hint for a full solve
-        pre_machines = [v for v in machines if v["capability"] <= max(event["complexity"] for event in late_events_grouped.values())]
+        # pre_machines = [v for v in machines if v["capability"] <= max(event["complexity"] for event in late_events_grouped.values())]
 
-        pre_instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(late_events_grouped.items())],
-            machines=pre_machines
-        )
+        # pre_instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(late_events_grouped.items())],
+        #     machines=pre_machines
+        # )
 
         config = SchedulerSolverConfig(time_limit_seconds=30, log_search_progress=False, optimization_tolerance=0.01, num_search_workers=16)
-        pre_solver = SchedulerSolver(pre_instance, config)
-        pre_solver._set_balanced_objective()
-        pre_solver._add_constraint_sequence_subevents()
-        pre_solution = pre_solver.solve(time_limit=30)
-        print(f"Pre-solve on late events - Solution status: {pre_solution.status}, Objective value: {pre_solution.objective_value}")
+        # pre_solver = SchedulerSolver(pre_instance, config)
+        # pre_solver._set_balanced_objective()
+        # pre_solver._add_constraint_sequence_subevents()
+        # pre_solution = pre_solver.solve(time_limit=30)
+        # print(f"Pre-solve on late events - Solution status: {pre_solution.status}, Objective value: {pre_solution.objective_value}")
 
         # save solution for debugging
         # pre_solution_df = pd.DataFrame(pre_solution.schedule)
@@ -447,9 +457,9 @@ def gtest():
         
 
         solver = SchedulerSolver(instance, config)
-        solver._add_presolve_hint(pre_solution)
+        # solver._add_presolve_hint(pre_solution)
         solver._set_balanced_objective()
-        solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
+        # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
         solver._add_constraint_sequence_subevents()
         # solver._add_constraint_machine_contiguous_block()
 
@@ -463,9 +473,9 @@ def gtest():
             break
 
     # save the final solution to csv for debugging organized by start date then machine
-    solution_df = pd.DataFrame(solution.schedule)
-    solution_df = solution_df.sort_values(by=["scheduledStartDate", "assignedMachineId"])
-    solution_df.to_csv("Inputs/final_solution.csv", index=False)
+    # solution_df = pd.DataFrame(solution.schedule)
+    # solution_df = solution_df.sort_values(by=["scheduledStartDate", "assignedMachineId"])
+    # solution_df.to_csv("Inputs/final_solution.csv", index=False)
 
     workday_minutes = 8 * 60
 
@@ -475,23 +485,23 @@ def gtest():
         actual_date = date.today() + timedelta(days=day_offset)
         return actual_date
 
-    excel_solution_df = solution_df[["designId", "assignedMachineId", "scheduledStartDate"]].copy()
-    excel_solution_df = excel_solution_df.rename(columns={"assignedMachineId": "assignedMachine"})
-    excel_solution_df["scheduledStartDate"] = excel_solution_df["scheduledStartDate"].apply(_model_minutes_to_excel_date)
+    # excel_solution_df = solution_df[["designId", "assignedMachineId", "scheduledStartDate"]].copy()
+    # excel_solution_df = excel_solution_df.rename(columns={"assignedMachineId": "assignedMachine"})
+    # excel_solution_df["scheduledStartDate"] = excel_solution_df["scheduledStartDate"].apply(_model_minutes_to_excel_date)
     
     # write to excel with formatting
-    import xlsxwriter
-    with pd.ExcelWriter("Inputs/final_solution.xlsx", engine="xlsxwriter") as writer:
-        excel_solution_df.to_excel(writer, index=False, sheet_name="Schedule")
-        workbook = writer.book
-        worksheet = writer.sheets["Schedule"]
+    # import xlsxwriter
+    # with pd.ExcelWriter("Inputs/final_solution.xlsx", engine="xlsxwriter") as writer:
+    #     excel_solution_df.to_excel(writer, index=False, sheet_name="Schedule")
+    #     workbook = writer.book
+    #     worksheet = writer.sheets["Schedule"]
 
-        date_format = workbook.add_format({"num_format": "yyyy-mm-dd"})
-        for idx, col in enumerate(excel_solution_df.columns):
-            if col == "scheduledStartDate":
-                worksheet.set_column(idx, idx, 20, date_format)
-            else:
-                worksheet.set_column(idx, idx, 18)
+    #     date_format = workbook.add_format({"num_format": "yyyy-mm-dd"})
+    #     for idx, col in enumerate(excel_solution_df.columns):
+    #         if col == "scheduledStartDate":
+    #             worksheet.set_column(idx, idx, 20, date_format)
+    #         else:
+    #             worksheet.set_column(idx, idx, 18)
         
 
     # Graph view

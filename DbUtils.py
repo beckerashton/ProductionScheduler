@@ -532,7 +532,7 @@ def getHistoricalScheduledOrders(minDate: date = date(2025, 1, 1), maxDate: date
             eodl.date_Creation >= '{minDate.strftime("%m/%d/%Y")}'
             AND eo.date_OrderRequestedToShip >= '{minDate.strftime("%m/%d/%Y")}'
             AND eo.date_OrderRequestedToShip <= '{maxDate.strftime("%m/%d/%Y")}'
-            AND eodl.ColorsTotal > 0
+            AND eodl.ColorsTotal > 0            
             AND eodl.cn_QtyToProduce > 0
             AND eo.id_OrderType = 11
             AND eo.sts_Shipped = 1
@@ -605,4 +605,6 @@ def refresh() -> None:
     extPath = os.path.join(dirPath, f"unscheduled_{date.today().strftime('%m_%d_%y')}.csv")
 
     getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90, saveToCsv= extPath)
-    
+
+# if __name__ == "__main__":
+#     getHistoricalScheduledOrders()

@@ -38,6 +38,7 @@ class DummyEvent:
     orderId: int
     designId: str
     estTime: int
+    setupTime: int
     requestedShipDate: date
     complexity: int
 
