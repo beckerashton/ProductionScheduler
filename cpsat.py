@@ -1,5 +1,8 @@
 from asyncio import events
 import collections
+import json
+from pathlib import Path
+from math import trunc
 from pyexpat import model
 import re
 import stat
@@ -7,12 +10,13 @@ from matplotlib.pylab import f
 import matplotlib.pyplot as plt
 from datetime import date, timedelta
 import numpy as np
+from openpyxl import load_workbook
 from ortools.sat.python import cp_model
 from pandas import DataFrame
 from pydantic import BaseModel, Field, PositiveInt, NonNegativeFloat, model_validator
 
 from OtherUtils import tempShow
-from Types import DummyEvent
+from Types import Event, EventGroup
 from DbUtils import peek, refresh 
 
 # Util func to convert date to int for cpsat model relative to a fixed start date
@@ -24,7 +28,7 @@ def _date_to_int(this_date: date | str, start_date: date = date.today()) -> int:
 
 # Container for the inputs to a scheduler instance
 class SchedulerInstance(BaseModel):
-    events: list[DummyEvent] = Field(..., description="List of events to be scheduled.")
+    events: list[EventGroup] = Field(..., description="List of events to be scheduled.")
     machines: list[dict] = Field(..., description="List of machines available for scheduling.")
 
     @model_validator(mode="before")
@@ -41,6 +45,8 @@ class SchedulerInstance(BaseModel):
         for event in self.events:
             if isinstance(event.requestedShipDate, str) or isinstance(event.requestedShipDate, date):
                 event.requestedShipDate = _date_to_int(event.requestedShipDate) * 8 * 60
+            if isinstance(event.estTime, float):
+                event.estTime = int(event.estTime)
         return self
 
 # Container for the configs of a scheduler instance
@@ -57,12 +63,13 @@ class SchedulerSolution(BaseModel):
     status: str = Field(..., description="Status of the solver after attempting to solve the scheduling problem.")
 
 
-def _event_duration(event: DummyEvent) -> int:
+def _event_duration(event: EventGroup) -> int:
     duration = getattr(event, "duration", None)
     if duration is None:
         duration = getattr(event, "estTime", None)
     if not isinstance(duration, int) or duration <= 0:
-        raise ValueError(f"Event {event.orderId} must have a positive integer duration/estTime.")
+        print(event)
+        raise ValueError(f"Event {event.groupId} must have a positive integer duration/estTime.")
     return duration
 
 
@@ -80,39 +87,39 @@ class _EventSchedulingVars:
             duration = _event_duration(event)
             requested_ship_date = event.requestedShipDate
             if not isinstance(requested_ship_date, int):
-                raise ValueError(f"Event {event.orderId} requestedShipDate must be an integer for this prototype.")
+                raise ValueError(f"Event {event.groupId} requestedShipDate must be an integer for this prototype.")
 
             eligible_machine_ids = [m["id"] for m in instance.machines if m["capability"] >= event.complexity]
             if not eligible_machine_ids:
-                raise ValueError(f"Event {event.orderId} has no eligible machines.")
+                raise ValueError(f"Event {event.groupId} has no eligible machines.")
 
             machine_var = model.new_int_var_from_domain(
                 cp_model.Domain.FromValues(eligible_machine_ids),
-                f"event_{event.orderId}_machine"
+                f"event_{event.groupId}_machine"
             )
-            start_var = model.new_int_var(0, self.horizon - duration, f"event_{event.orderId}_start")
-            end_var = model.new_int_var(duration, self.horizon, f"event_{event.orderId}_end")
+            start_var = model.new_int_var(0, self.horizon - duration, f"event_{event.groupId}_start")
+            end_var = model.new_int_var(duration, self.horizon, f"event_{event.groupId}_end")
 
             presence_vars = []
             for machine_id in eligible_machine_ids:
-                presence = model.new_bool_var(f"event_{event.orderId}_on_machine_{machine_id}")
+                presence = model.new_bool_var(f"event_{event.groupId}_on_machine_{machine_id}")
                 interval_var = model.new_optional_interval_var(
                     start_var,
                     duration,
                     end_var,
                     presence,
-                    f"event_{event.orderId}_interval_machine_{machine_id}",
+                    f"event_{event.groupId}_interval_machine_{machine_id}",
                 )
-                self.event_presence[event.orderId, machine_id] = presence
+                self.event_presence[event.groupId, machine_id] = presence
                 self.machine_intervals[machine_id].append(interval_var)
                 model.add(machine_var == machine_id).only_enforce_if(presence)
                 presence_vars.append(presence)
 
             model.add_exactly_one(presence_vars)
 
-            self.event_to_machine[event.orderId] = machine_var
-            self.event_start[event.orderId] = start_var
-            self.event_end[event.orderId] = end_var
+            self.event_to_machine[event.groupId] = machine_var
+            self.event_start[event.groupId] = start_var
+            self.event_end[event.groupId] = end_var
         
 
 class SchedulerSolver:
@@ -132,21 +139,21 @@ class SchedulerSolver:
 
     def _add_constraint_force_before_ship_date(self):
         for event in self.instance.events:
-            self.model.add(self._event_vars.event_end[event.orderId] <= event.requestedShipDate)
+            self.model.add(self._event_vars.event_end[event.groupId] <= event.requestedShipDate)
 
     def _add_constraint_force_before_ship_date_ignore_lates(self):
         for event in self.instance.events:
             if event.requestedShipDate > 0:  # Only enforce for events that are not already late
-                self.model.add(self._event_vars.event_end[event.orderId] <= event.requestedShipDate)
+                self.model.add(self._event_vars.event_end[event.groupId] <= event.requestedShipDate)
 
     def _add_constraint_force_before_ship_date_ignore_hinted(self, pre_solution: SchedulerSolution = None):
         hinted_event_ids = set()
         if pre_solution:
-            hinted_event_ids = {e["orderId"] for e in pre_solution.schedule}
+            hinted_event_ids = {e["groupId"] for e in pre_solution.schedule}
         
         for event in self.instance.events:
-            if event.requestedShipDate > 0 and event.orderId not in hinted_event_ids:
-                self.model.add(self._event_vars.event_end[event.orderId] <= event.requestedShipDate)
+            if event.requestedShipDate > 0 and event.groupId not in hinted_event_ids:
+                self.model.add(self._event_vars.event_end[event.groupId] <= event.requestedShipDate)
 
     def _add_constraint_machine_no_overlap(self):
         for machine in self.instance.machines:
@@ -163,13 +170,13 @@ class SchedulerSolver:
             machine_events = [
                 event
                 for event in self.instance.events
-                if (event.orderId, machine_id) in self._event_vars.event_presence
+                if (event.groupId, machine_id) in self._event_vars.event_presence
             ]
             if not machine_events:
                 continue
 
             presences = [
-                self._event_vars.event_presence[event.orderId, machine_id]
+                self._event_vars.event_presence[event.groupId, machine_id]
                 for event in machine_events
             ]
 
@@ -181,19 +188,19 @@ class SchedulerSolver:
             adjusted_ends = []
 
             for event in machine_events:
-                presence = self._event_vars.event_presence[event.orderId, machine_id]
-                start = self._event_vars.event_start[event.orderId]
-                end = self._event_vars.event_end[event.orderId]
+                presence = self._event_vars.event_presence[event.groupId, machine_id]
+                start = self._event_vars.event_start[event.groupId]
+                end = self._event_vars.event_end[event.groupId]
 
                 adjusted_start = self.model.new_int_var(
                     0,
                     horizon,
-                    f"event_{event.orderId}_adjusted_start_machine_{machine_id}",
+                    f"event_{event.groupId}_adjusted_start_machine_{machine_id}",
                 )
                 adjusted_end = self.model.new_int_var(
                     0,
                     horizon,
-                    f"event_{event.orderId}_adjusted_end_machine_{machine_id}",
+                    f"event_{event.groupId}_adjusted_end_machine_{machine_id}",
                 )
 
                 self.model.add(adjusted_start == start).only_enforce_if(presence)
@@ -216,7 +223,7 @@ class SchedulerSolver:
             self.model.add(busy_span == 0).only_enforce_if(machine_used.Not())
 
             total_processing_time = sum(
-                _event_duration(event) * self._event_vars.event_presence[event.orderId, machine_id]
+                _event_duration(event) * self._event_vars.event_presence[event.groupId, machine_id]
                 for event in machine_events
             )
             self.model.add(total_processing_time == busy_span)
@@ -235,7 +242,7 @@ class SchedulerSolver:
             for i in range(len(subevents) - 1):
                 event_i = subevents[i]
                 event_j = subevents[i + 1]
-                self.model.add(self._event_vars.event_end[event_i.orderId] <= self._event_vars.event_start[event_j.orderId])
+                self.model.add(self._event_vars.event_end[event_i.groupId] <= self._event_vars.event_start[event_j.groupId])
 
     # constraint that on the same machine there is a gap of 1 time unit between events
     def _add_constraint_pad_between_events(self):
@@ -247,7 +254,7 @@ class SchedulerSolver:
                     for j in range(i + 1, len(intervals_on_machine)):
                         interval_i = intervals_on_machine[i]
                         interval_j = intervals_on_machine[j]
-                        # Extract orderId from interval name: "event_{orderId}_interval_machine_{machineId}"
+                        # Extract groupId from interval name: "event_{groupId}_interval_machine_{machineId}"
                         event_id_i = int(interval_i.Name().split("_")[1])
                         event_id_j = int(interval_j.Name().split("_")[1])
                         presence_i = self._event_vars.event_presence[event_id_i, machine_id]
@@ -264,9 +271,9 @@ class SchedulerSolver:
     def _add_soft_deadline_penalty(self):
         penalties = []
         for event in self.instance.events:
-            tardiness = self.model.new_int_var(0, 10000, f"tardiness_{event.orderId}")
+            tardiness = self.model.new_int_var(0, 10000, f"tardiness_{event.groupId}")
             self.model.add_max_equality(tardiness, [
-                self._event_vars.event_end[event.orderId] - event.requestedShipDate,
+                self._event_vars.event_end[event.groupId] - event.requestedShipDate,
                 0
             ])
             penalties.append(tardiness)
@@ -274,7 +281,7 @@ class SchedulerSolver:
     
     def _add_presolve_hint(self, pre_solution: SchedulerSolution):
         for scheduled_event in pre_solution.schedule:
-            order_id = scheduled_event["orderId"]
+            order_id = scheduled_event["groupId"]
             assigned_machine_id = scheduled_event["assignedMachineId"]
             scheduled_start = scheduled_event["scheduledStartDate"]
             self.model.add(self._event_vars.event_to_machine[order_id] == assigned_machine_id)
@@ -282,12 +289,12 @@ class SchedulerSolver:
 
     def _set_makespan_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
-        self.model.add_max_equality(makespan, [self._event_vars.event_end[event.orderId] for event in self.instance.events])
+        self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
         self.model.minimize(makespan)
 
     def _set_makespan_with_tardiness_penalty_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
-        self.model.add_max_equality(makespan, [self._event_vars.event_end[event.orderId] for event in self.instance.events])
+        self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
         penalties = None
         penalties = self._add_soft_deadline_penalty()
         self.model.minimize(makespan + 1000 * sum(penalties))
@@ -295,14 +302,14 @@ class SchedulerSolver:
     def _set_balanced_objective(self):
         # Minimize makespan AND variance in machine load
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
-        self.model.add_max_equality(makespan, [self._event_vars.event_end[e.orderId] for e in self.instance.events])
+        self.model.add_max_equality(makespan, [self._event_vars.event_end[e.groupId] for e in self.instance.events])
         
         machine_loads = []
         for machine in self.instance.machines:
             if machine["id"] == 6:  # ignores stryker when balancing loads
                 continue
             load = sum(
-                self._event_vars.event_presence[event.orderId, machine["id"]] * event.estTime
+                self._event_vars.event_presence[event.groupId, machine["id"]] * event.estTime
                 for event in self.instance.events
                 if machine["capability"] >= event.complexity
             )
@@ -330,11 +337,11 @@ class SchedulerSolver:
             return SchedulerSolution(
                 schedule=[
                     {
-                        "orderId": event.orderId,
+                        "groupId": event.groupId,
                         "designId": event.designId,
-                        "assignedMachineId": self.solver.Value(self._event_vars.event_to_machine[event.orderId]),
-                        "scheduledStartDate": self.solver.Value(self._event_vars.event_start[event.orderId]),
-                        "scheduledEndDate": self.solver.Value(self._event_vars.event_end[event.orderId]),
+                        "assignedMachineId": self.solver.Value(self._event_vars.event_to_machine[event.groupId]),
+                        "scheduledStartDate": self.solver.Value(self._event_vars.event_start[event.groupId]),
+                        "scheduledEndDate": self.solver.Value(self._event_vars.event_end[event.groupId]),
                         "requestedShipDate": event.requestedShipDate,
                         "complexity": event.complexity
                     }
@@ -350,74 +357,256 @@ class SchedulerSolver:
             status=self.solver.StatusName(status)
         )
 
+
+def _write_excel_cells_with_app(filename: str, sheet_name: str, cell_updates: list[tuple[int, int, int]]) -> str:
+    try:
+        from win32com.client import DispatchEx
+    except ImportError as exc:
+        raise RuntimeError(
+            "Writing Excel files while preserving external links requires pywin32."
+        ) from exc
+
+    source_path = Path(filename).resolve()
+    output_path = source_path.with_name(f"{source_path.stem}_with_schedule{source_path.suffix}")
+
+    excel = DispatchEx("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+
+    workbook = None
+    worksheet = None
+    try:
+        workbook = excel.Workbooks.Open(str(source_path), UpdateLinks=0, ReadOnly=False)
+        worksheet = workbook.Worksheets(sheet_name)
+
+        for row_idx, column_idx, value in cell_updates:
+            worksheet.Cells(row_idx, column_idx).Value = value
+
+        workbook.SaveCopyAs(str(output_path))
+        return str(output_path)
+    finally:
+        if workbook is not None:
+            workbook.Close(SaveChanges=False)
+        worksheet = None
+        excel.Quit()
+
+
+def _save_interactive_schedule_graph(graph_rows: list[dict], workday_minutes: int, output_path: str | Path) -> str | None:
+    if not graph_rows:
+        return None
+
+    try:
+        import plotly.graph_objects as go
+    except ImportError as exc:
+        raise RuntimeError(
+            "Saving an interactive schedule graph requires plotly."
+        ) from exc
+
+    resolved_output_path = Path(output_path).resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    complexity_levels = sorted({row["complexity"] for row in graph_rows})
+    palette = [
+        "#6f4e7c",
+        "#0b84a5",
+        "#9dd866",
+        "#f6c85f",
+        "#ca472f",
+        "#ffa056",
+        "#8dddd0",
+        "#b30000",
+    ]
+    complexity_to_color = {
+        complexity: palette[index % len(palette)]
+        for index, complexity in enumerate(complexity_levels)
+    }
+
+    fig = go.Figure()
+    legend_seen = set()
+
+    for row in graph_rows:
+        complexity = row["complexity"]
+        show_legend = complexity not in legend_seen
+        legend_seen.add(complexity)
+
+        fig.add_trace(
+            go.Bar(
+                x=[row["duration"]],
+                y=[row["machineLabel"]],
+                base=[row["start"]],
+                orientation="h",
+                marker={
+                    "color": complexity_to_color[complexity],
+                    "line": {"color": "black", "width": 0.5},
+                },
+                text=[str(row["groupId"])],
+                textposition="inside",
+                name=f"Complexity {complexity}",
+                legendgroup=f"complexity_{complexity}",
+                showlegend=show_legend,
+                customdata=[[
+                    row["groupId"],
+                    row["designId"],
+                    row["machineId"],
+                    row["startText"],
+                    row["endText"],
+                    row["duration"],
+                    row["estTime"],
+                    row["requestedShipText"],
+                    complexity,
+                ]],
+                hovertemplate=(
+                    "Order ID: %{customdata[0]}<br>"
+                    "Design ID: %{customdata[1]}<br>"
+                    "Machine ID: %{customdata[2]}<br>"
+                    "Start: %{customdata[3]}<br>"
+                    "End: %{customdata[4]}<br>"
+                    "Duration: %{customdata[5]}<br>"
+                    "Est Time: %{customdata[6]}<br>"
+                    "Requested Ship: %{customdata[7]}<br>"
+                    "Complexity: %{customdata[8]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    max_end = max(row["end"] for row in graph_rows)
+    tick_limit = ((max_end + workday_minutes - 1) // workday_minutes + 1) * workday_minutes
+    tick_values = list(range(0, tick_limit + 1, workday_minutes))
+    tick_labels = [str(value // workday_minutes) for value in tick_values]
+    machine_labels = sorted({row["machineLabel"] for row in graph_rows}, key=lambda label: int(label.split()[-1]))
+
+    fig.update_layout(
+        title="Schedule by Machine (interactive)",
+        template="plotly_white",
+        hovermode="closest",
+        barmode="overlay",
+        xaxis={
+            "title": "Day",
+            "tickmode": "array",
+            "tickvals": tick_values,
+            "ticktext": tick_labels,
+            "showgrid": True,
+            "gridcolor": "rgba(0, 0, 0, 0.15)",
+        },
+        yaxis={
+            "title": "Machine",
+            "categoryorder": "array",
+            "categoryarray": machine_labels,
+        },
+        legend={"title": {"text": "Complexity"}},
+    )
+
+    fig.write_html(
+        str(resolved_output_path),
+        include_plotlyjs=True,
+        full_html=True,
+        config={"displaylogo": False},
+    )
+    return str(resolved_output_path)
+
+    
+def write_event_sequence_into_excel(solution: SchedulerSolution, filename: str) -> None:
+    
+    # Read values with openpyxl, but write/save through Excel so workbook links survive.
+    wb = load_workbook(filename, data_only=True, keep_links=True)
+    ws = wb["Sheet3"]
+    
+    # Create a mapping of (Design No root, Location) -> solution data
+    solution_map = {}
+    for scheduled_event in solution.schedule:
+        design_id: str = scheduled_event["designId"]
+        design_root, location = design_id.split("_", 1)
+        solution_map[(design_root, location)] = {
+            "assignedMachine": scheduled_event["assignedMachineId"],
+            "scheduledStart": scheduled_event["scheduledStartDate"],
+            "setupCompleted": False
+        }
+    
+    # remap scheduledStart to instead be the order per machine (1, 2, 3...)
+    machine_to_events = collections.defaultdict(list)
+    for scheduled_event in solution.schedule:
+        machine_to_events[scheduled_event["assignedMachineId"]].append(scheduled_event)
+    for machine_id, events in machine_to_events.items():
+        events.sort(key=lambda e: e["scheduledStartDate"])
+        for sequence, event in enumerate(events, start=1):
+            design_id = event["designId"]
+            design_root, location = design_id.split("_", 1)
+            solution_map[(design_root, location)]["sequence"] = sequence
+    
+    cell_updates = []
+
+    # Iterate through rows starting from header row + 1
+    for row_idx, row in enumerate(ws.iter_rows(min_row=3, values_only=True), start=3):
+        # Assuming Design No is in column C (index 2) and Location is in column E (index 4)
+        design_no_cell = ws.cell(row=row_idx, column=3)  # Column C
+        location_cell = ws.cell(row=row_idx, column=5)   # Column E
+
+        design_no = design_no_cell.value
+        location = location_cell.value
+        
+        if design_no is None or location is None:
+            continue
+        
+        design_root = str(design_no).split(".", 1)[0].strip()
+        location_str = str(location).strip()
+        
+        # Look up in solution map
+        if (design_root, location_str) in solution_map:
+            scheduled_data = solution_map[(design_root, location_str)]
+
+            # Write to Press column (assuming column R, index 18) and Sequence column (assuming column S, index 19)
+            cell_updates.append((row_idx, 18, scheduled_data["assignedMachine"]))
+            cell_updates.append((row_idx, 19, scheduled_data["sequence"]))
+            if scheduled_data["setupCompleted"] == True:
+                cell_updates.append((row_idx, 20, "1"))
+            else:
+                solution_map[(design_root, location_str)]["setupCompleted"] = True
+
+    wb.close()
+    _write_excel_cells_with_app(filename, "Sheet3", cell_updates)
+
+
 def gtest():
-    # events = [
-    #     DummyEvent(1, 0, 5, 10, 0),
-    #     DummyEvent(2, 0, 3, 8, 0),
-    #     DummyEvent(3, 1, 4, 12, 1),
-    #     DummyEvent(4, 1, 2, 9, 1),
-    #     DummyEvent(5, 2, 6, 15, 2),
-    #     DummyEvent(6, 3, 1, 7, 2),
-    #     # DummyEvent(7, 4, 10, 15, 3),
-    #     DummyEvent(8, 5, 2, 17, 0),
-    #     DummyEvent(9, 4, 5, 20, 3),
-    #     DummyEvent(10, 5, 5, 18, 0)
-    # ]
-
-    # from random import randint, seed
-    # seed(12)
-    # events = []
-    # # dc = [0] * 18 + [1] * 24 + [2] * 34 + [3] * 14 # fake
-    # normalizer = float(100 / (2466 + 430 + 1258 + 297))
-    # dc = [0] * int(2466*normalizer) + [1] * int(430*normalizer) + [2] * int(1258*normalizer) + [3] * int(297*normalizer)
-    # print(dc.count(0), dc.count(1), dc.count(2), dc.count(3))
-    # for _ in range(1000):
-    #     orderId = len(events) + 1
-    #     designId = randint(0, 199)
-    #     estTime = randint(1, 20)
-    #     requestedShipDate = randint(1, 100)
-    #     complexity = dc[designId % len(dc)]
-    #     events.append(DummyEvent(orderId, designId, estTime, requestedShipDate, complexity))
-
     import pandas as pd
-    # df = pd.read_csv('Inputs/unscheduled_03_06_26.csv')
-    # df = pd.read_csv('Inputs/copy.csv')
-    # input_df = pd.read_excel("C:/Users/Aston/Documents/Production Scheduler Demo.xlsx", sheet_name="Sheet3", header=2, engine="openpyxl", usecols="C,E,M,P,V")
-    input_df = pd.read_excel("C:/Users/Aston/Documents/Production Scheduler Demo.xlsx", nrows=500, sheet_name="Sheet3", header=1, usecols="B,C,E,M,P,U,V")
-    input_df = input_df[input_df["Week_Sch"] == 11]
+    excel_path: str = "C:/Users/Aston/Documents/Production Scheduler Demo.xlsx"
+    
+    input_df = pd.read_excel(excel_path, sheet_name="Sheet3", header=1, usecols="B,C,E,M,P,U,V")
+    input_df = input_df.dropna(subset=["Order No", "Design No", "Location", "DueDate", "Imp", "No_Colors"])
     
     df = input_df.rename(columns={"Order No": "id_Order", "Design No": "id_Design", "Location": "Location", "DueDate": "date_OrderRequestedToShip", "Imp": "cn_QtyToProduce", "No_Colors": "ColorsTotal"})
     df = df.dropna(subset=["id_Order", "id_Design", "Location", "date_OrderRequestedToShip", "cn_QtyToProduce", "ColorsTotal"])
-    
-    df["estTime"] = df.apply(lambda row: DummyEvent.estTimeFromQuantityAndColorsInMinutes(row["cn_QtyToProduce"], row["ColorsTotal"]), axis=1)
-    df["complexity"] = df.apply(lambda row: DummyEvent.complexityFromColorCount(row["ColorsTotal"]), axis=1)
+
+    df["runTime"] = df.apply(lambda row: row["cn_QtyToProduce"] / 250 * 60, axis=1)
+    df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
+    df["complexity"] = df.apply(lambda row: Event.complexityFromColorCount(row["ColorsTotal"]), axis=1)
     df["designId"] = df.apply(lambda row: f"{int(row['id_Design'])}_{row['Location']}", axis=1)
     df["date_OrderRequestedToShip"] = df["date_OrderRequestedToShip"].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else date.fromisoformat(x) if isinstance(x, str) else x)
-    df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
 
-    events = [DummyEvent(row["id_Order"], row["designId"], row["estTime"], row["setupTime"], row["date_OrderRequestedToShip"], row["complexity"]) for _, row in df.iterrows()]
-    
+    events = [Event(row["id_Order"], row["designId"], row["runTime"], row["setupTime"], row["date_OrderRequestedToShip"], row["complexity"]) for _, row in df.iterrows()]
+
     events_grouped = collections.defaultdict(lambda: {"estTime": 0, "requestedShipDate": 0, "complexity": 0})
     for event in events:
         if event.designId not in events_grouped:
-            events_grouped[event.designId] = {"estTime": event.estTime, "requestedShipDate": event.requestedShipDate, "complexity": event.complexity}
+            events_grouped[event.designId] = {"estTime": event.setupTime + event.runTime, "requestedShipDate": event.requestedShipDate, "complexity": event.complexity}
         else:
-            events_grouped[event.designId]["estTime"] += event.estTime - event.setupTime
+            events_grouped[event.designId]["estTime"] += event.runTime
             events_grouped[event.designId]["requestedShipDate"] = min(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate)
+            print(f"WARNING: Same designId with different complexity found. Shouldn't happen ({event.designId})") if events_grouped[event.designId]["complexity"] != event.complexity else None
             events_grouped[event.designId]["complexity"] = max(events_grouped[event.designId]["complexity"], event.complexity)
     
+    print(f"Complexity distribution: {collections.Counter(e.complexity for e in events)}")
     
     max_presolve_window_days = 7
-    for i in range(7, max_presolve_window_days + 1, 1):
-        # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=i)}
-        print(f"Complexity distribution: {collections.Counter(e.complexity for e in events)}")
+    for presolve_days in range(0, max_presolve_window_days + 1, 1):
+        # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=presolve_days)}
 
         machines = [
             {"id": 1, "capability": 2},
             {"id": 2, "capability": 1},
-            {"id": 3, "capability": 2},
-            {"id": 4, "capability": 2},
-            {"id": 5, "capability": 0},
+            # {"id": 3, "capability": 2},  # Disabled for sample printing (talked with brian about this not being the case)
+            {"id": 4, "capability": 2},     #and instead just treating samples as a reservation / event group that can move 
+            {"id": 5, "capability": 0},     #around the rest of the schedule but this needs to prove itself first
             {"id": 6, "capability": 3},
             {"id": 7, "capability": 0},
         ]
@@ -440,7 +629,7 @@ def gtest():
         # pre_solution_df = pd.DataFrame(pre_solution.schedule)
         # pre_solution_df.to_csv("Inputs/pre_solution.csv", index=False)
 
-        instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(events_grouped.items())],
+        instance = SchedulerInstance(events=[EventGroup(i, k, v["estTime"], v["complexity"], v["requestedShipDate"]) for i, (k, v) in enumerate(events_grouped.items())],
             machines=machines
         )
         
@@ -459,6 +648,7 @@ def gtest():
         solver = SchedulerSolver(instance, config)
         # solver._add_presolve_hint(pre_solution)
         solver._set_balanced_objective()
+        # solver._set_makespan_objective()
         # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
         solver._add_constraint_sequence_subevents()
         # solver._add_constraint_machine_contiguous_block()
@@ -467,9 +657,10 @@ def gtest():
         print(f"Solution status: {solution.status}, Objective value: {solution.objective_value}")
 
         if solution.status == "INFEASIBLE":
-            print(f"Failed with a presolve range of {i} days. Trying again with larger presolve range.")
+            print(f"Failed with a presolve range of {presolve_days} days. Trying again with larger presolve range.")
         else:
-            print(f"Succeeded with a presolve range of {i} days.")
+            print(f"Succeeded with a presolve range of {presolve_days} days.")
+            write_event_sequence_into_excel(solution, excel_path)
             break
 
     # save the final solution to csv for debugging organized by start date then machine
@@ -529,8 +720,9 @@ def gtest():
         complexity_to_color = {comp: colors[i] for i, comp in enumerate(complexity_levels)}
         
         fig, ax = plt.subplots(figsize=(14, 8))
-        event_by_order_id = {event.orderId: event for event in instance.events}
+        event_by_order_id = {event.groupId: event for event in instance.events}
         bars_with_details = []
+        interactive_schedule_rows = []
         
         # Group by machine
         machine_schedules = collections.defaultdict(list)
@@ -548,7 +740,7 @@ def gtest():
             
             for job in jobs:
                 # Get event complexity for color
-                event = event_by_order_id[job["orderId"]]
+                event = event_by_order_id[job["groupId"]]
                 color = complexity_to_color[event.complexity]
                 
                 bar_container = ax.barh(
@@ -562,7 +754,7 @@ def gtest():
                 )
                 bar = bar_container.patches[0]
                 details_text = (
-                    f"Order ID: {job['orderId']}\n"
+                    f"Order ID: {job['groupId']}\n"
                     f"Design ID: {event.designId}\n"
                     f"Machine ID: {job['assignedMachineId']}\n"
                     f"Start: {_model_minutes_to_datetime_text(job['scheduledStartDate'])}\n"
@@ -573,17 +765,32 @@ def gtest():
                     f"Complexity: {event.complexity}"
                 )
                 bars_with_details.append((bar, details_text))
+                interactive_schedule_rows.append({
+                    "groupId": job["groupId"],
+                    "designId": event.designId,
+                    "machineId": job["assignedMachineId"],
+                    "machineLabel": f"Machine {job['assignedMachineId']}",
+                    "start": job["scheduledStartDate"],
+                    "end": job["scheduledEndDate"],
+                    "duration": job["scheduledEndDate"] - job["scheduledStartDate"],
+                    "startText": _model_minutes_to_datetime_text(job["scheduledStartDate"]),
+                    "endText": _model_minutes_to_datetime_text(job["scheduledEndDate"]),
+                    "estTime": event.estTime,
+                    "requestedShipText": _model_minutes_to_datetime_text(event.requestedShipDate),
+                    "complexity": event.complexity,
+                })
                 ax.text(job["scheduledStartDate"] + (job["scheduledEndDate"] - job["scheduledStartDate"]) / 2, y_pos, 
-                       f'{job["orderId"]}', ha='center', va='center', fontsize=8, color='white', weight='bold')
+                       f'{job["groupId"]}', ha='center', va='center', fontsize=8, color='white', weight='bold')
             
             y_pos += 1
         
         ax.set_yticks(yticks)
         ax.set_yticklabels(ylabels)
-        ax.set_xlabel("Date")
+        # ax.set_xlabel("Date")
         ax.xaxis.set_major_locator(MultipleLocator(workday_minutes))
-        ax.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: val // workday_minutes))  # Show days as integers on x-axis
+        # ax.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
+        # plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
         ax.set_ylabel("Machine")
         ax.set_title("Schedule by Machine (colored by complexity)")
         ax.grid(axis='x', alpha=0.3)
@@ -634,110 +841,117 @@ def gtest():
         fig.canvas.mpl_connect("motion_notify_event", _on_hover)
 
         # Requested ship date vs actual scheduled end date view
-        requested_ship_dates = []
-        scheduled_end_dates = []
-        comparison_colors = []
-        comparison_point_details = []
+        # requested_ship_dates = []
+        # scheduled_end_dates = []
+        # comparison_colors = []
+        # comparison_point_details = []
 
-        for job in solution.schedule:
-            event = event_by_order_id[job["orderId"]]
-            requested_time = event.requestedShipDate
-            end_time = job["scheduledEndDate"]
-            delta_minutes = end_time - requested_time
-            status_text = "Late" if delta_minutes > 0 else "On-time / Early"
-            delta_text = f"{delta_minutes} min" if delta_minutes != 0 else "0 min"
+        # for job in solution.schedule:
+        #     event = event_by_order_id[job["groupId"]]
+        #     requested_time = event.requestedShipDate
+        #     end_time = job["scheduledEndDate"]
+        #     delta_minutes = end_time - requested_time
+        #     status_text = "Late" if delta_minutes > 0 else "On-time / Early"
+        #     delta_text = f"{delta_minutes} min" if delta_minutes != 0 else "0 min"
 
-            requested_ship_dates.append(requested_time)
-            scheduled_end_dates.append(end_time)
-            comparison_colors.append("tab:red" if end_time > requested_time else "tab:green")
-            comparison_point_details.append(
-                f"Order ID: {job['orderId']}\n"
-                f"Design ID: {event.designId}\n"
-                f"Machine ID: {job['assignedMachineId']}\n"
-                f"Requested Ship: {_model_minutes_to_datetime_text(requested_time)}\n"
-                f"Scheduled End: {_model_minutes_to_datetime_text(end_time)}\n"
-                f"Status: {status_text}\n"
-                f"Delta: {delta_text}"
-            )
+        #     requested_ship_dates.append(requested_time)
+        #     scheduled_end_dates.append(end_time)
+        #     comparison_colors.append("tab:red" if end_time > requested_time else "tab:green")
+        #     comparison_point_details.append(
+        #         f"Order ID: {job['groupId']}\n"
+        #         f"Design ID: {event.designId}\n"
+        #         f"Machine ID: {job['assignedMachineId']}\n"
+        #         f"Requested Ship: {_model_minutes_to_datetime_text(requested_time)}\n"
+        #         f"Scheduled End: {_model_minutes_to_datetime_text(end_time)}\n"
+        #         f"Status: {status_text}\n"
+        #         f"Delta: {delta_text}"
+        #     )
 
-        fig2, ax2 = plt.subplots(figsize=(10, 8))
-        comparison_scatter = ax2.scatter(
-            requested_ship_dates,
-            scheduled_end_dates,
-            c=comparison_colors,
-            alpha=0.8,
-            edgecolors="black",
-            linewidths=0.4,
-        )
+        # fig2, ax2 = plt.subplots(figsize=(10, 8))
+        # comparison_scatter = ax2.scatter(
+        #     requested_ship_dates,
+        #     scheduled_end_dates,
+        #     c=comparison_colors,
+        #     alpha=0.8,
+        #     edgecolors="black",
+        #     linewidths=0.4,
+        # )
 
-        min_time = min(min(requested_ship_dates), min(scheduled_end_dates))
-        max_time = max(max(requested_ship_dates), max(scheduled_end_dates))
-        ax2.plot(
-            [min_time, max_time],
-            [min_time, max_time],
-            linestyle="--",
-            color="black",
-            linewidth=1,
-            label="Scheduled End = Requested Ship",
-        )
+        # min_time = min(min(requested_ship_dates), min(scheduled_end_dates))
+        # max_time = max(max(requested_ship_dates), max(scheduled_end_dates))
+        # ax2.plot(
+        #     [min_time, max_time],
+        #     [min_time, max_time],
+        #     linestyle="--",
+        #     color="black",
+        #     linewidth=1,
+        #     label="Scheduled End = Requested Ship",
+        # )
 
-        late_orders = sum(1 for i in range(len(requested_ship_dates)) if scheduled_end_dates[i] > requested_ship_dates[i])
-        on_time_orders = len(requested_ship_dates) - late_orders
+        # late_orders = sum(1 for i in range(len(requested_ship_dates)) if scheduled_end_dates[i] > requested_ship_dates[i])
+        # on_time_orders = len(requested_ship_dates) - late_orders
 
-        ax2.set_xlabel("Requested Ship Date")
-        ax2.set_ylabel("Scheduled End Date")
-        ax2.set_title(f"Requested vs Scheduled End ({on_time_orders} on-time, {late_orders} late)")
-        ax2.xaxis.set_major_locator(MultipleLocator(workday_minutes))
-        ax2.yaxis.set_major_locator(MultipleLocator(workday_minutes))
-        ax2.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        ax2.yaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
-        ax2.grid(alpha=0.3)
+        # ax2.set_xlabel("Requested Ship Date")
+        # ax2.set_ylabel("Scheduled End Date")
+        # ax2.set_title(f"Requested vs Scheduled End ({on_time_orders} on-time, {late_orders} late)")
+        # ax2.xaxis.set_major_locator(MultipleLocator(workday_minutes))
+        # ax2.yaxis.set_major_locator(MultipleLocator(workday_minutes))
+        # ax2.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
+        # ax2.yaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
+        # plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+        # ax2.grid(alpha=0.3)
 
-        comparison_legend = [
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:green', markeredgecolor='black', markersize=7, label='On-time or early'),
-            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:red', markeredgecolor='black', markersize=7, label='Late'),
-        ]
-        ax2.legend(handles=comparison_legend + [ax2.lines[0]], loc='upper left')
+        # comparison_legend = [
+        #     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:green', markeredgecolor='black', markersize=7, label='On-time or early'),
+        #     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:red', markeredgecolor='black', markersize=7, label='Late'),
+        # ]
+        # ax2.legend(handles=comparison_legend + [ax2.lines[0]], loc='upper left')
 
-        comparison_tooltip = ax2.annotate(
-            "",
-            xy=(0, 0),
-            xytext=(10, 10),
-            textcoords="offset points",
-            bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "black", "alpha": 0.9},
-            arrowprops={"arrowstyle": "->", "color": "black"},
-        )
-        comparison_tooltip.set_visible(False)
+        # comparison_tooltip = ax2.annotate(
+        #     "",
+        #     xy=(0, 0),
+        #     xytext=(10, 10),
+        #     textcoords="offset points",
+        #     bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "black", "alpha": 0.9},
+        #     arrowprops={"arrowstyle": "->", "color": "black"},
+        # )
+        # comparison_tooltip.set_visible(False)
 
-        def _update_comparison_tooltip(point_index: int):
-            comparison_tooltip.xy = (requested_ship_dates[point_index], scheduled_end_dates[point_index])
-            comparison_tooltip.set_text(comparison_point_details[point_index])
+        # def _update_comparison_tooltip(point_index: int):
+        #     comparison_tooltip.xy = (requested_ship_dates[point_index], scheduled_end_dates[point_index])
+        #     comparison_tooltip.set_text(comparison_point_details[point_index])
 
-        def _on_comparison_hover(mouse_event):
-            if mouse_event.inaxes != ax2:
-                if comparison_tooltip.get_visible():
-                    comparison_tooltip.set_visible(False)
-                    fig2.canvas.draw_idle()
-                return
+        # def _on_comparison_hover(mouse_event):
+        #     if mouse_event.inaxes != ax2:
+        #         if comparison_tooltip.get_visible():
+        #             comparison_tooltip.set_visible(False)
+        #             fig2.canvas.draw_idle()
+        #         return
 
-            contains, ind = comparison_scatter.contains(mouse_event)
-            if contains and ind.get("ind"):
-                point_index = ind["ind"][0]
-                _update_comparison_tooltip(point_index)
-                if not comparison_tooltip.get_visible():
-                    comparison_tooltip.set_visible(True)
-                fig2.canvas.draw_idle()
-                return
+        #     contains, ind = comparison_scatter.contains(mouse_event)
+        #     if contains and ind.get("ind"):
+        #         point_index = ind["ind"][0]
+        #         _update_comparison_tooltip(point_index)
+        #         if not comparison_tooltip.get_visible():
+        #             comparison_tooltip.set_visible(True)
+        #         fig2.canvas.draw_idle()
+        #         return
 
-            if comparison_tooltip.get_visible():
-                comparison_tooltip.set_visible(False)
-                fig2.canvas.draw_idle()
+        #     if comparison_tooltip.get_visible():
+        #         comparison_tooltip.set_visible(False)
+        #         fig2.canvas.draw_idle()
 
-        fig2.canvas.mpl_connect("motion_notify_event", _on_comparison_hover)
+        # fig2.canvas.mpl_connect("motion_notify_event", _on_comparison_hover)
         
         fig.tight_layout()
-        fig2.tight_layout()
+        interactive_graph_path = _save_interactive_schedule_graph(
+            interactive_schedule_rows,
+            workday_minutes,
+            Path("Outputs") / "schedule_graph_interactive.html",
+        )
+        if interactive_graph_path:
+            print(f"Saved interactive schedule graph to {interactive_graph_path}")
+        # fig2.tight_layout()
         plt.show()
 
 gtest()

@@ -34,10 +34,10 @@ class WeekSchedule:
         self.sunday = sunday
 
 @dataclass
-class DummyEvent:
+class Event:
     orderId: int
     designId: str
-    estTime: int
+    runTime: int
     setupTime: int
     requestedShipDate: date
     complexity: int
@@ -52,10 +52,19 @@ class DummyEvent:
             return 2
         else:
             return 3
-    
+
+    # [DEPRECATED] was used for calculating total estTime but now its split into runTime and setupTime for better granularity in scheduling logic 
     @staticmethod
     def estTimeFromQuantityAndColorsInMinutes(quantity: int, colors: int) -> int:
         return int(((quantity / 250) * 60) + (colors * 10))
+
+@dataclass
+class EventGroup:
+    groupId: int
+    designId: str
+    estTime: int
+    complexity: int
+    requestedShipDate: date
 
 @dataclass
 class ProductionEvent:
