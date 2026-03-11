@@ -55,12 +55,18 @@ class SchedulerSolverConfig(BaseModel):
     log_search_progress: bool = Field(False, description="Whether to log search progress during solving.")
     optimization_tolerance: NonNegativeFloat = Field(0.01, description="Tolerance for optimization.")
     num_search_workers: PositiveInt = Field(1, description="Number of parallel workers for the solver.")
+    enumerate_all_solutions: bool = Field(False, description="Whether to enumerate all solutions (Must be equal to optimal).")
+
 
 # Container for the outputs of a scheduler instance
 class SchedulerSolution(BaseModel):
     schedule: list[dict] = Field(..., description="List of scheduled events with assigned machines and times.")
     objective_value: float = Field(..., description="Objective value of the solution.")
     status: str = Field(..., description="Status of the solver after attempting to solve the scheduling problem.")
+    equally_optimal_schedules: list[list[dict]] = Field(
+        default_factory=list,
+        description="Additional schedules with the same optimal objective value.",
+    )
 
 
 def _event_duration(event: EventGroup) -> int:
@@ -120,7 +126,73 @@ class _EventSchedulingVars:
             self.event_to_machine[event.groupId] = machine_var
             self.event_start[event.groupId] = start_var
             self.event_end[event.groupId] = end_var
-        
+
+
+def _read_solution_value(value_source: object, expression) -> int:
+    value_fn = getattr(value_source, "value", None)
+    if callable(value_fn):
+        return int(value_fn(expression))
+    return int(value_source.Value(expression))
+
+
+def _build_schedule_snapshot(
+    instance: SchedulerInstance,
+    event_to_machine: dict[int, object],
+    event_start: dict[int, object],
+    event_end: dict[int, object],
+    value_source: object,
+) -> list[dict]:
+    return [
+        {
+            "groupId": event.groupId,
+            "designId": event.designId,
+            "assignedMachineId": _read_solution_value(value_source, event_to_machine[event.groupId]),
+            "scheduledStartDate": _read_solution_value(value_source, event_start[event.groupId]),
+            "scheduledEndDate": _read_solution_value(value_source, event_end[event.groupId]),
+            "requestedShipDate": event.requestedShipDate,
+            "complexity": event.complexity,
+        }
+        for event in instance.events
+    ]
+
+
+def _schedule_signature(schedule: list[dict]) -> tuple[tuple[int, int, int, int], ...]:
+    return tuple(
+        (job["groupId"], job["assignedMachineId"], job["scheduledStartDate"], job["scheduledEndDate"])
+        for job in sorted(schedule, key=lambda row: row["groupId"])
+    )
+
+
+class _ScheduleCollector(cp_model.CpSolverSolutionCallback):
+    def __init__(
+        self,
+        instance: SchedulerInstance,
+        event_to_machine: dict[int, object],
+        event_start: dict[int, object],
+        event_end: dict[int, object],
+    ):
+        super().__init__()
+        self._instance = instance
+        self._event_to_machine = event_to_machine
+        self._event_start = event_start
+        self._event_end = event_end
+        self._seen_signatures: set[tuple[tuple[int, int, int, int], ...]] = set()
+        self.schedules: list[list[dict]] = []
+
+    def on_solution_callback(self) -> None:
+        schedule = _build_schedule_snapshot(
+            self._instance,
+            self._event_to_machine,
+            self._event_start,
+            self._event_end,
+            self,
+        )
+        schedule_signature = _schedule_signature(schedule)
+        if schedule_signature in self._seen_signatures:
+            return
+        self._seen_signatures.add(schedule_signature)
+        self.schedules.append(schedule)
+
 
 class SchedulerSolver:
     def __init__(self, instance: SchedulerInstance, config: SchedulerSolverConfig):
@@ -128,6 +200,7 @@ class SchedulerSolver:
         self.config = config
         self.model = cp_model.CpModel()
         self._event_vars = _EventSchedulingVars(instance, self.model)
+        self._objective_var: cp_model.IntVar | None = None
         self._build_model()
         self.solver = cp_model.CpSolver()
 
@@ -290,14 +363,22 @@ class SchedulerSolver:
     def _set_makespan_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
         self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
+        self._objective_var = makespan
         self.model.minimize(makespan)
 
     def _set_makespan_with_tardiness_penalty_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
         self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
-        penalties = None
         penalties = self._add_soft_deadline_penalty()
-        self.model.minimize(makespan + 1000 * sum(penalties))
+        max_total_penalty = 10000 * len(self.instance.events)
+        weighted_objective = self.model.new_int_var(
+            0,
+            self._event_vars.horizon + 1000 * max_total_penalty,
+            "makespan_with_tardiness_penalty",
+        )
+        self.model.add(weighted_objective == makespan + 1000 * sum(penalties))
+        self._objective_var = weighted_objective
+        self.model.minimize(weighted_objective)
 
     def _set_balanced_objective(self):
         # Minimize makespan AND variance in machine load
@@ -320,37 +401,132 @@ class SchedulerSolver:
         min_load = self.model.new_int_var(0, self._event_vars.horizon, "min_load")
         self.model.add_max_equality(max_load, machine_loads)
         self.model.add_min_equality(min_load, machine_loads)
-        
-        self.model.minimize(makespan * 10 + (max_load - min_load))  # Weighted multi-objective
+
+        balanced_objective = self.model.new_int_var(0, self._event_vars.horizon * 11, "balanced_objective")
+        self.model.add(balanced_objective == makespan * 10 + (max_load - min_load))
+        self._objective_var = balanced_objective
+        self.model.minimize(balanced_objective)  # Weighted multi-objective
 
     def _build_model(self):
         self._add_default_constraints()
 
-    def solve(self, time_limit: float | None = None) -> SchedulerSolution:
-        self.solver.parameters.max_time_in_seconds = time_limit if time_limit is not None else self.config.time_limit_seconds
-        self.solver.parameters.log_search_progress = self.config.log_search_progress
-        self.solver.parameters.relative_gap_limit = self.config.optimization_tolerance
-        self.solver.parameters.num_search_workers = self.config.num_search_workers
-        status = self.solver.Solve(self.model)
-        
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-            return SchedulerSolution(
-                schedule=[
-                    {
-                        "groupId": event.groupId,
-                        "designId": event.designId,
-                        "assignedMachineId": self.solver.Value(self._event_vars.event_to_machine[event.groupId]),
-                        "scheduledStartDate": self.solver.Value(self._event_vars.event_start[event.groupId]),
-                        "scheduledEndDate": self.solver.Value(self._event_vars.event_end[event.groupId]),
-                        "requestedShipDate": event.requestedShipDate,
-                        "complexity": event.complexity
-                    }
-                    for event in self.instance.events
-                ],
-                objective_value=self.solver.ObjectiveValue(),
-                status=self.solver.StatusName(status)
+    def _configure_solver(
+        self,
+        solver: cp_model.CpSolver,
+        time_limit: float | None,
+        *,
+        enumerate_all_solutions: bool = False,
+        force_exact_optimal: bool = False,
+        num_search_workers: int | None = None,
+    ) -> None:
+        solver.parameters.max_time_in_seconds = time_limit if time_limit is not None else self.config.time_limit_seconds
+        solver.parameters.log_search_progress = self.config.log_search_progress
+        solver.parameters.relative_gap_limit = 0.0 if force_exact_optimal else self.config.optimization_tolerance
+        solver.parameters.num_search_workers = num_search_workers if num_search_workers is not None else self.config.num_search_workers
+        solver.parameters.enumerate_all_solutions = enumerate_all_solutions
+
+    def _enumerate_equally_optimal_schedules(
+        self,
+        primary_schedule: list[dict],
+        optimal_objective_value: float,
+        time_limit: float | None = None,
+    ) -> list[list[dict]]:
+        if self._objective_var is None:
+            print("Skipped equally optimal enumeration because no objective has been set on the model.")
+            return []
+
+        optimal_objective = int(round(optimal_objective_value))
+        enumeration_model = self.model.clone()
+        enumeration_objective_var = enumeration_model.get_int_var_from_proto_index(self._objective_var.Index())
+        enumeration_model.clear_objective()
+        enumeration_model.add(enumeration_objective_var == optimal_objective)
+
+        cloned_event_to_machine = {
+            group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
+            for group_id, var in self._event_vars.event_to_machine.items()
+        }
+        cloned_event_start = {
+            group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
+            for group_id, var in self._event_vars.event_start.items()
+        }
+        cloned_event_end = {
+            group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
+            for group_id, var in self._event_vars.event_end.items()
+        }
+
+        collector = _ScheduleCollector(
+            self.instance,
+            cloned_event_to_machine,
+            cloned_event_start,
+            cloned_event_end,
+        )
+        enumeration_solver = cp_model.CpSolver()
+        self._configure_solver(
+            enumeration_solver,
+            time_limit,
+            enumerate_all_solutions=True,
+            force_exact_optimal=True,
+            num_search_workers=1,
+        )
+        enumeration_status = enumeration_solver.SearchForAllSolutions(enumeration_model, collector)
+
+        primary_signature = _schedule_signature(primary_schedule)
+        alternate_schedules = [
+            schedule
+            for schedule in collector.schedules
+            if _schedule_signature(schedule) != primary_signature
+        ]
+
+        if enumeration_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            print(
+                "Equal-optimum enumeration failed "
+                f"(status={enumeration_solver.StatusName(enumeration_status)}); "
+                "returning the primary optimal solution only."
             )
-        
+            return []
+
+        if enumeration_status == cp_model.FEASIBLE:
+            print(
+                "Equal-optimum enumeration hit the solver limit before exhausting all schedules; "
+                f"returning {len(alternate_schedules)} alternate schedule(s) found so far."
+            )
+
+        return alternate_schedules
+
+    def solve(self, time_limit: float | None = None) -> SchedulerSolution:
+        self._configure_solver(
+            self.solver,
+            time_limit,
+            enumerate_all_solutions=False,
+            force_exact_optimal=self.config.enumerate_all_solutions,
+        )
+        status = self.solver.Solve(self.model)
+
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            solution = SchedulerSolution(
+                schedule=_build_schedule_snapshot(
+                    self.instance,
+                    self._event_vars.event_to_machine,
+                    self._event_vars.event_start,
+                    self._event_vars.event_end,
+                    self.solver,
+                ),
+                objective_value=self.solver.ObjectiveValue(),
+                status=self.solver.StatusName(status),
+            )
+
+            if self.config.enumerate_all_solutions:
+                if status != cp_model.OPTIMAL:
+                    print("Skipped equally optimal enumeration because the solver did not prove optimality.")
+                else:
+                    solution.equally_optimal_schedules = self._enumerate_equally_optimal_schedules(
+                        solution.schedule,
+                        solution.objective_value,
+                        time_limit,
+                    )
+
+            return solution
+
         return SchedulerSolution(
             schedule=[],
             objective_value=0.0,
@@ -567,7 +743,167 @@ def write_event_sequence_into_excel(solution: SchedulerSolution, filename: str) 
     _write_excel_cells_with_app(filename, "Sheet3", cell_updates)
 
 
-def gtest():
+def _model_minutes_to_datetime_text(model_minutes: float, workday_minutes: int) -> str:
+    clamped_minutes = max(0, int(round(model_minutes)))
+    day_offset, minute_of_day = divmod(clamped_minutes, workday_minutes)
+    actual_date = date.today() + timedelta(days=day_offset)
+    hour = 8 + (minute_of_day // 60)
+    minute = minute_of_day % 60
+    return f"{actual_date.isoformat()} {hour:02d}:{minute:02d}"
+
+
+def _plot_schedule_graph(
+    schedule: list[dict],
+    instance: SchedulerInstance,
+    workday_minutes: int,
+    title: str,
+    interactive_output_path: str | Path | None = None,
+) -> str | None:
+    from matplotlib.ticker import FuncFormatter, MultipleLocator
+
+    complexity_levels = sorted(set(event.complexity for event in instance.events))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(complexity_levels)))
+    complexity_to_color = {complexity: colors[index] for index, complexity in enumerate(complexity_levels)}
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    event_by_order_id = {event.groupId: event for event in instance.events}
+    bars_with_details = []
+    interactive_schedule_rows = []
+
+    machine_schedules = collections.defaultdict(list)
+    for job in schedule:
+        machine_schedules[job["assignedMachineId"]].append(job)
+
+    yticks = []
+    ylabels = []
+    y_pos = 0
+
+    for machine_id in sorted(machine_schedules.keys()):
+        jobs = sorted(machine_schedules[machine_id], key=lambda job: job["scheduledStartDate"])
+        yticks.append(y_pos)
+        ylabels.append(f"Machine {machine_id}")
+
+        for job in jobs:
+            event = event_by_order_id[job["groupId"]]
+            color = complexity_to_color[event.complexity]
+
+            bar_container = ax.barh(
+                y_pos,
+                job["scheduledEndDate"] - job["scheduledStartDate"],
+                left=job["scheduledStartDate"],
+                height=0.6,
+                color=color,
+                edgecolor="black",
+                linewidth=0.5,
+            )
+            bar = bar_container.patches[0]
+            details_text = (
+                f"Order ID: {job['groupId']}\n"
+                f"Design ID: {event.designId}\n"
+                f"Machine ID: {job['assignedMachineId']}\n"
+                f"Start: {_model_minutes_to_datetime_text(job['scheduledStartDate'], workday_minutes)}\n"
+                f"End: {_model_minutes_to_datetime_text(job['scheduledEndDate'], workday_minutes)}\n"
+                f"Duration: {job['scheduledEndDate'] - job['scheduledStartDate']}\n"
+                f"Est Time: {event.estTime}\n"
+                f"Requested Ship: {_model_minutes_to_datetime_text(event.requestedShipDate, workday_minutes)}\n"
+                f"Complexity: {event.complexity}"
+            )
+            bars_with_details.append((bar, details_text))
+            interactive_schedule_rows.append({
+                "groupId": job["groupId"],
+                "designId": event.designId,
+                "machineId": job["assignedMachineId"],
+                "machineLabel": f"Machine {job['assignedMachineId']}",
+                "start": job["scheduledStartDate"],
+                "end": job["scheduledEndDate"],
+                "duration": job["scheduledEndDate"] - job["scheduledStartDate"],
+                "startText": _model_minutes_to_datetime_text(job["scheduledStartDate"], workday_minutes),
+                "endText": _model_minutes_to_datetime_text(job["scheduledEndDate"], workday_minutes),
+                "estTime": event.estTime,
+                "requestedShipText": _model_minutes_to_datetime_text(event.requestedShipDate, workday_minutes),
+                "complexity": event.complexity,
+            })
+            ax.text(
+                job["scheduledStartDate"] + (job["scheduledEndDate"] - job["scheduledStartDate"]) / 2,
+                y_pos,
+                f"{job['groupId']}",
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="white",
+                weight="bold",
+            )
+
+        y_pos += 1
+
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels)
+    ax.xaxis.set_major_locator(MultipleLocator(workday_minutes))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: value // workday_minutes))
+    ax.set_ylabel("Machine")
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+
+    legend_elements = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=complexity_to_color[complexity], edgecolor="black", label=f"Complexity {complexity}")
+        for complexity in complexity_levels
+    ]
+    ax.legend(handles=legend_elements, loc="upper right")
+
+    tooltip = ax.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(10, 10),
+        textcoords="offset points",
+        bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "black", "alpha": 0.9},
+        arrowprops={"arrowstyle": "->", "color": "black"},
+    )
+    tooltip.set_visible(False)
+
+    def _update_tooltip(selected_bar, details_text: str):
+        tooltip.xy = (
+            selected_bar.get_x() + selected_bar.get_width() / 2,
+            selected_bar.get_y() + selected_bar.get_height() / 2,
+        )
+        tooltip.set_text(details_text)
+
+    def _on_hover(mouse_event):
+        if mouse_event.inaxes != ax:
+            if tooltip.get_visible():
+                tooltip.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+
+        for bar, details_text in bars_with_details:
+            contains, _ = bar.contains(mouse_event)
+            if contains:
+                _update_tooltip(bar, details_text)
+                if not tooltip.get_visible():
+                    tooltip.set_visible(True)
+                fig.canvas.draw_idle()
+                return
+
+        if tooltip.get_visible():
+            tooltip.set_visible(False)
+            fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("motion_notify_event", _on_hover)
+    fig.tight_layout()
+
+    if interactive_output_path is None:
+        return None
+
+    interactive_graph_path = _save_interactive_schedule_graph(
+        interactive_schedule_rows,
+        workday_minutes,
+        interactive_output_path,
+    )
+    if interactive_graph_path:
+        print(f"Saved interactive schedule graph to {interactive_graph_path}")
+    return interactive_graph_path
+
+
+def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_excel: bool = False):
     import pandas as pd
     excel_path: str = "C:/Users/Aston/Documents/Production Scheduler Demo.xlsx"
     
@@ -618,7 +954,13 @@ def gtest():
         #     machines=pre_machines
         # )
 
-        config = SchedulerSolverConfig(time_limit_seconds=30, log_search_progress=False, optimization_tolerance=0.01, num_search_workers=16)
+        config = SchedulerSolverConfig(
+            time_limit_seconds=30, 
+            log_search_progress=False, 
+            optimization_tolerance=0.01, 
+            num_search_workers=16,
+            enumerate_all_solutions=False
+        )
         # pre_solver = SchedulerSolver(pre_instance, config)
         # pre_solver._set_balanced_objective()
         # pre_solver._add_constraint_sequence_subevents()
@@ -651,16 +993,19 @@ def gtest():
         # solver._set_makespan_objective()
         # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
         solver._add_constraint_sequence_subevents()
-        # solver._add_constraint_machine_contiguous_block()
+        # solver._add_constraint_machine_contiguous_block() # from what i can tell this isn't needed, i forget why but they already schedule contiguous
 
-        solution = solver.solve(time_limit=30)
+        solution = solver.solve()
         print(f"Solution status: {solution.status}, Objective value: {solution.objective_value}")
+
+
 
         if solution.status == "INFEASIBLE":
             print(f"Failed with a presolve range of {presolve_days} days. Trying again with larger presolve range.")
         else:
             print(f"Succeeded with a presolve range of {presolve_days} days.")
-            write_event_sequence_into_excel(solution, excel_path)
+            if write_solution_to_excel:
+                write_event_sequence_into_excel(solution, excel_path)
             break
 
     # save the final solution to csv for debugging organized by start date then machine
@@ -697,263 +1042,37 @@ def gtest():
 
     # Graph view
     if solution.status in ["OPTIMAL", "FEASIBLE"]:
-        import matplotlib.pyplot as plt
-        from matplotlib.ticker import FuncFormatter, MultipleLocator
+        schedules_to_plot = [solution.schedule, *solution.equally_optimal_schedules]
+        total_solutions = len(schedules_to_plot)
+        if total_solutions > 1:
+            print(f"Rendering {total_solutions} equally optimal schedule graphs.")
 
-        def _model_minutes_to_datetime_text(model_minutes: float, include_newline: bool = False) -> str:
-            clamped_minutes = max(0, int(round(model_minutes)))
-            day_offset, minute_of_day = divmod(clamped_minutes, workday_minutes)
-            actual_date = date.today() + timedelta(days=day_offset)
-            hour = 8 + (minute_of_day // 60)
-            minute = minute_of_day % 60
-            separator = "\n" if include_newline else " "
-            return f"{actual_date.isoformat()}{separator}{hour:02d}:{minute:02d}"
-
-        def _x_tick_formatter(value: float, _pos: int) -> str:
-            clamped_minutes = max(0, int(round(value)))
-            day_offset = clamped_minutes // workday_minutes
-            return (date.today() + timedelta(days=day_offset)).isoformat()
-        
-        # Create color map for complexity levels
-        complexity_levels = sorted(set(e.complexity for e in instance.events))
-        colors = plt.cm.viridis(np.linspace(0, 1, len(complexity_levels)))
-        complexity_to_color = {comp: colors[i] for i, comp in enumerate(complexity_levels)}
-        
-        fig, ax = plt.subplots(figsize=(14, 8))
-        event_by_order_id = {event.groupId: event for event in instance.events}
-        bars_with_details = []
-        interactive_schedule_rows = []
-        
-        # Group by machine
-        machine_schedules = collections.defaultdict(list)
-        for job in solution.schedule:
-            machine_schedules[job["assignedMachineId"]].append(job)
-        
-        yticks = []
-        ylabels = []
-        y_pos = 0
-        
-        for machine_id in sorted(machine_schedules.keys()):
-            jobs = sorted(machine_schedules[machine_id], key=lambda x: x["scheduledStartDate"])
-            yticks.append(y_pos)
-            ylabels.append(f"Machine {machine_id}")
-            
-            for job in jobs:
-                # Get event complexity for color
-                event = event_by_order_id[job["groupId"]]
-                color = complexity_to_color[event.complexity]
-                
-                bar_container = ax.barh(
-                    y_pos,
-                    job["scheduledEndDate"] - job["scheduledStartDate"],
-                    left=job["scheduledStartDate"],
-                    height=0.6,
-                    color=color,
-                    edgecolor='black',
-                    linewidth=0.5,
+        for solution_index, schedule_to_plot in enumerate(schedules_to_plot, start=1):
+            title = f"Schedule by Machine (objective {solution.objective_value:g})"
+            if total_solutions > 1:
+                title = (
+                    f"Schedule by Machine (solution {solution_index}/{total_solutions}, "
+                    f"objective {solution.objective_value:g})"
                 )
-                bar = bar_container.patches[0]
-                details_text = (
-                    f"Order ID: {job['groupId']}\n"
-                    f"Design ID: {event.designId}\n"
-                    f"Machine ID: {job['assignedMachineId']}\n"
-                    f"Start: {_model_minutes_to_datetime_text(job['scheduledStartDate'])}\n"
-                    f"End: {_model_minutes_to_datetime_text(job['scheduledEndDate'])}\n"
-                    f"Duration: {job['scheduledEndDate'] - job['scheduledStartDate']}\n"
-                    f"Est Time: {event.estTime}\n"
-                    f"Requested Ship: {_model_minutes_to_datetime_text(event.requestedShipDate)}\n"
-                    f"Complexity: {event.complexity}"
-                )
-                bars_with_details.append((bar, details_text))
-                interactive_schedule_rows.append({
-                    "groupId": job["groupId"],
-                    "designId": event.designId,
-                    "machineId": job["assignedMachineId"],
-                    "machineLabel": f"Machine {job['assignedMachineId']}",
-                    "start": job["scheduledStartDate"],
-                    "end": job["scheduledEndDate"],
-                    "duration": job["scheduledEndDate"] - job["scheduledStartDate"],
-                    "startText": _model_minutes_to_datetime_text(job["scheduledStartDate"]),
-                    "endText": _model_minutes_to_datetime_text(job["scheduledEndDate"]),
-                    "estTime": event.estTime,
-                    "requestedShipText": _model_minutes_to_datetime_text(event.requestedShipDate),
-                    "complexity": event.complexity,
-                })
-                ax.text(job["scheduledStartDate"] + (job["scheduledEndDate"] - job["scheduledStartDate"]) / 2, y_pos, 
-                       f'{job["groupId"]}', ha='center', va='center', fontsize=8, color='white', weight='bold')
-            
-            y_pos += 1
-        
-        ax.set_yticks(yticks)
-        ax.set_yticklabels(ylabels)
-        # ax.set_xlabel("Date")
-        ax.xaxis.set_major_locator(MultipleLocator(workday_minutes))
-        ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: val // workday_minutes))  # Show days as integers on x-axis
-        # ax.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        # plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-        ax.set_ylabel("Machine")
-        ax.set_title("Schedule by Machine (colored by complexity)")
-        ax.grid(axis='x', alpha=0.3)
-        
-        # Add legend for complexity colors
-        legend_elements = [plt.Rectangle((0,0),1,1, facecolor=complexity_to_color[comp], 
-                                        edgecolor='black', label=f'Complexity {comp}')
-                          for comp in complexity_levels]
-        ax.legend(handles=legend_elements, loc='upper right')
 
-        tooltip = ax.annotate(
-            "",
-            xy=(0, 0),
-            xytext=(10, 10),
-            textcoords="offset points",
-            bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "black", "alpha": 0.9},
-            arrowprops={"arrowstyle": "->", "color": "black"},
-        )
-        tooltip.set_visible(False)
+            interactive_output_path = None
+            if total_solutions == 1:
+                interactive_output_path = Path("Outputs") / "schedule_graph_interactive.html"
 
-        def _update_tooltip(selected_bar, details_text):
-            tooltip.xy = (
-                selected_bar.get_x() + selected_bar.get_width() / 2,
-                selected_bar.get_y() + selected_bar.get_height() / 2,
+            _plot_schedule_graph(
+                schedule_to_plot,
+                instance,
+                workday_minutes,
+                title,
+                interactive_output_path if save_graph else None,
             )
-            tooltip.set_text(details_text)
 
-        def _on_hover(mouse_event):
-            if mouse_event.inaxes != ax:
-                if tooltip.get_visible():
-                    tooltip.set_visible(False)
-                    fig.canvas.draw_idle()
-                return
+        if show_graph:
+            plt.show()
 
-            for bar, details_text in bars_with_details:
-                contains, _ = bar.contains(mouse_event)
-                if contains:
-                    _update_tooltip(bar, details_text)
-                    if not tooltip.get_visible():
-                        tooltip.set_visible(True)
-                    fig.canvas.draw_idle()
-                    return
-
-            if tooltip.get_visible():
-                tooltip.set_visible(False)
-                fig.canvas.draw_idle()
-
-        fig.canvas.mpl_connect("motion_notify_event", _on_hover)
-
-        # Requested ship date vs actual scheduled end date view
-        # requested_ship_dates = []
-        # scheduled_end_dates = []
-        # comparison_colors = []
-        # comparison_point_details = []
-
-        # for job in solution.schedule:
-        #     event = event_by_order_id[job["groupId"]]
-        #     requested_time = event.requestedShipDate
-        #     end_time = job["scheduledEndDate"]
-        #     delta_minutes = end_time - requested_time
-        #     status_text = "Late" if delta_minutes > 0 else "On-time / Early"
-        #     delta_text = f"{delta_minutes} min" if delta_minutes != 0 else "0 min"
-
-        #     requested_ship_dates.append(requested_time)
-        #     scheduled_end_dates.append(end_time)
-        #     comparison_colors.append("tab:red" if end_time > requested_time else "tab:green")
-        #     comparison_point_details.append(
-        #         f"Order ID: {job['groupId']}\n"
-        #         f"Design ID: {event.designId}\n"
-        #         f"Machine ID: {job['assignedMachineId']}\n"
-        #         f"Requested Ship: {_model_minutes_to_datetime_text(requested_time)}\n"
-        #         f"Scheduled End: {_model_minutes_to_datetime_text(end_time)}\n"
-        #         f"Status: {status_text}\n"
-        #         f"Delta: {delta_text}"
-        #     )
-
-        # fig2, ax2 = plt.subplots(figsize=(10, 8))
-        # comparison_scatter = ax2.scatter(
-        #     requested_ship_dates,
-        #     scheduled_end_dates,
-        #     c=comparison_colors,
-        #     alpha=0.8,
-        #     edgecolors="black",
-        #     linewidths=0.4,
-        # )
-
-        # min_time = min(min(requested_ship_dates), min(scheduled_end_dates))
-        # max_time = max(max(requested_ship_dates), max(scheduled_end_dates))
-        # ax2.plot(
-        #     [min_time, max_time],
-        #     [min_time, max_time],
-        #     linestyle="--",
-        #     color="black",
-        #     linewidth=1,
-        #     label="Scheduled End = Requested Ship",
-        # )
-
-        # late_orders = sum(1 for i in range(len(requested_ship_dates)) if scheduled_end_dates[i] > requested_ship_dates[i])
-        # on_time_orders = len(requested_ship_dates) - late_orders
-
-        # ax2.set_xlabel("Requested Ship Date")
-        # ax2.set_ylabel("Scheduled End Date")
-        # ax2.set_title(f"Requested vs Scheduled End ({on_time_orders} on-time, {late_orders} late)")
-        # ax2.xaxis.set_major_locator(MultipleLocator(workday_minutes))
-        # ax2.yaxis.set_major_locator(MultipleLocator(workday_minutes))
-        # ax2.xaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        # ax2.yaxis.set_major_formatter(FuncFormatter(_x_tick_formatter))
-        # plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
-        # ax2.grid(alpha=0.3)
-
-        # comparison_legend = [
-        #     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:green', markeredgecolor='black', markersize=7, label='On-time or early'),
-        #     plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='tab:red', markeredgecolor='black', markersize=7, label='Late'),
-        # ]
-        # ax2.legend(handles=comparison_legend + [ax2.lines[0]], loc='upper left')
-
-        # comparison_tooltip = ax2.annotate(
-        #     "",
-        #     xy=(0, 0),
-        #     xytext=(10, 10),
-        #     textcoords="offset points",
-        #     bbox={"boxstyle": "round,pad=0.4", "fc": "white", "ec": "black", "alpha": 0.9},
-        #     arrowprops={"arrowstyle": "->", "color": "black"},
-        # )
-        # comparison_tooltip.set_visible(False)
-
-        # def _update_comparison_tooltip(point_index: int):
-        #     comparison_tooltip.xy = (requested_ship_dates[point_index], scheduled_end_dates[point_index])
-        #     comparison_tooltip.set_text(comparison_point_details[point_index])
-
-        # def _on_comparison_hover(mouse_event):
-        #     if mouse_event.inaxes != ax2:
-        #         if comparison_tooltip.get_visible():
-        #             comparison_tooltip.set_visible(False)
-        #             fig2.canvas.draw_idle()
-        #         return
-
-        #     contains, ind = comparison_scatter.contains(mouse_event)
-        #     if contains and ind.get("ind"):
-        #         point_index = ind["ind"][0]
-        #         _update_comparison_tooltip(point_index)
-        #         if not comparison_tooltip.get_visible():
-        #             comparison_tooltip.set_visible(True)
-        #         fig2.canvas.draw_idle()
-        #         return
-
-        #     if comparison_tooltip.get_visible():
-        #         comparison_tooltip.set_visible(False)
-        #         fig2.canvas.draw_idle()
-
-        # fig2.canvas.mpl_connect("motion_notify_event", _on_comparison_hover)
-        
-        fig.tight_layout()
-        interactive_graph_path = _save_interactive_schedule_graph(
-            interactive_schedule_rows,
-            workday_minutes,
-            Path("Outputs") / "schedule_graph_interactive.html",
-        )
-        if interactive_graph_path:
-            print(f"Saved interactive schedule graph to {interactive_graph_path}")
-        # fig2.tight_layout()
-        plt.show()
-
-gtest()
-
-# refresh()
+if __name__ == "__main__":
+    main(
+        show_graph= input("Show graph? (y/n): ").strip().lower() == "y", 
+        save_graph=input("Save graph as html? (y/n): ").strip().lower() == "y", 
+        write_solution_to_excel=input("Write solution to Excel? (y/n): ").strip().lower() == "y"
+    )

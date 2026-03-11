@@ -1,0 +1,10 @@
+matplotlib
+mplcursors
+numpy
+openpyxl
+ortools
+pandas
+pydantic
+pyodbc
+python-dotenv
+scipy
