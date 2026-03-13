@@ -366,6 +366,73 @@ class SchedulerSolver:
         self._objective_var = makespan
         self.model.minimize(makespan)
 
+    # Multi-layered makespan objective that minimizes the makespan on each subset of machines
+    # where each iteration of ignores the previous max makespan machines to create a secondary objective of minimizing the makespan of the remaining machines, and so on for a specified number of iterations (makespan_checks)
+    def _set_multi_makespan_objective(self, makespan_checks: int):
+        if makespan_checks <= 0:
+            raise ValueError("makespan_checks must be >= 1")
+
+        remaining_machine_ids = [machine["id"] for machine in self.instance.machines]
+        objective_terms = []
+
+        for check in range(makespan_checks):
+            makespan = self.model.new_int_var(0, self._event_vars.horizon, f"makespan_check_{check}")
+            adjusted_event_ends = []
+
+            for event in self.instance.events:
+                presences_on_remaining = [
+                    self._event_vars.event_presence[event.groupId, machine_id]
+                    for machine_id in remaining_machine_ids
+                    if (event.groupId, machine_id) in self._event_vars.event_presence
+                ]
+                if not presences_on_remaining:
+                    continue
+
+                if len(presences_on_remaining) == 1:
+                    event_on_remaining = presences_on_remaining[0]
+                else:
+                    event_on_remaining = self.model.new_bool_var(
+                        f"event_{event.groupId}_on_remaining_check_{check}"
+                    )
+                    # Exactly-one assignment makes this sum either 0 or 1.
+                    self.model.add(event_on_remaining == sum(presences_on_remaining))
+
+                adjusted_end = self.model.new_int_var(
+                    0,
+                    self._event_vars.horizon,
+                    f"event_{event.groupId}_adjusted_end_check_{check}",
+                )
+                self.model.add(adjusted_end == self._event_vars.event_end[event.groupId]).only_enforce_if(
+                    event_on_remaining
+                )
+                self.model.add(adjusted_end == 0).only_enforce_if(event_on_remaining.Not())
+                adjusted_event_ends.append(adjusted_end)
+
+            if adjusted_event_ends:
+                self.model.add_max_equality(makespan, adjusted_event_ends)
+            else:
+                self.model.add(makespan == 0)
+
+            objective_terms.append(makespan * (makespan_checks - check))
+
+            if check < makespan_checks - 1 and remaining_machine_ids:
+                # Decision variables cannot be sorted in Python, so peel off a deterministic
+                # prefix of machines for each subsequent tier.
+                remove_count = max(1, len(remaining_machine_ids) // makespan_checks)
+                remaining_machine_ids = remaining_machine_ids[remove_count:]
+
+        weighted_objective_upper_bound = self._event_vars.horizon * sum(
+            makespan_checks - check for check in range(len(objective_terms))
+        )
+        weighted_objective = self.model.new_int_var(
+            0,
+            weighted_objective_upper_bound,
+            "multi_makespan_objective",
+        )
+        self.model.add(weighted_objective == sum(objective_terms))
+        self._objective_var = weighted_objective
+        self.model.minimize(weighted_objective)
+
     def _set_makespan_with_tardiness_penalty_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
         self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
@@ -543,7 +610,7 @@ def _write_excel_cells_with_app(filename: str, sheet_name: str, cell_updates: li
         ) from exc
 
     source_path = Path(filename).resolve()
-    output_path = source_path.with_name(f"{source_path.stem}_with_schedule{source_path.suffix}")
+    output_path = source_path.with_name(f"{source_path.stem}_with_schedule({date.today().day}){source_path.suffix}")
 
     excel = DispatchEx("Excel.Application")
     excel.Visible = False
@@ -989,8 +1056,9 @@ def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_e
 
         solver = SchedulerSolver(instance, config)
         # solver._add_presolve_hint(pre_solution)
-        solver._set_balanced_objective()
+        # solver._set_balanced_objective()
         # solver._set_makespan_objective()
+        solver._set_multi_makespan_objective(makespan_checks=3)
         # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
         solver._add_constraint_sequence_subevents()
         # solver._add_constraint_machine_contiguous_block() # from what i can tell this isn't needed, i forget why but they already schedule contiguous
