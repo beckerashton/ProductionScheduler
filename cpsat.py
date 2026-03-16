@@ -6,7 +6,7 @@ from asyncio import events
 from datetime import date, timedelta
 from math import trunc
 from pathlib import Path
-from typing import Dict, Optional, no_type_check
+from typing import no_type_check
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -135,20 +135,20 @@ class _EventSchedulingVars:
             self.event_start[event.groupId] = start_var
             self.event_end[event.groupId] = end_var
 
-@no_type_check # this func is goofy 
-def _read_solution_value(value_source: object, expression) -> int:
-    value_fn = getattr(value_source, "value", None)
-    if callable(value_fn):
-        return int(value_fn(expression))
+
+def _read_solution_value(
+    value_source: cp_model.CpSolver | cp_model.CpSolverSolutionCallback,
+    expression: cp_model.LinearExprT,
+) -> int:
     return int(value_source.Value(expression))
 
 
 def _build_schedule_snapshot(
     instance: SchedulerInstance,
-    event_to_machine: Dict[int, cp_model.IntVar],
-    event_start: Dict[int, cp_model.IntVar],
-    event_end: Dict[int, cp_model.IntVar],
-    value_source: object,
+    event_to_machine: dict[int, cp_model.IntVar],
+    event_start: dict[int, cp_model.IntVar],
+    event_end: dict[int, cp_model.IntVar],
+    value_source: cp_model.CpSolver | cp_model.CpSolverSolutionCallback,
 ) -> list[dict]:
     return [
         {
@@ -176,9 +176,9 @@ class _ScheduleCollector(cp_model.CpSolverSolutionCallback):
     def __init__(
         self,
         instance: SchedulerInstance,
-        event_to_machine: Dict[int, cp_model.IntVar],
-        event_start: Dict[int, cp_model.IntVar],
-        event_end: Dict[int, cp_model.IntVar],
+        event_to_machine: dict[int, cp_model.IntVar],
+        event_start: dict[int, cp_model.IntVar],
+        event_end: dict[int, cp_model.IntVar],
     ):
         super().__init__()
         self._instance = instance
@@ -229,7 +229,7 @@ class SchedulerSolver:
                 self.model.add(self._event_vars.event_end[event.groupId] <= event.requestedShipDate)
 
     # [Not updated since estTime split, complexity split, and requestedShipDate int conversion, may need adjustments to work with new event structure]
-    # def _add_constraint_force_before_ship_date_ignore_hinted(self, pre_solution: Optional[SchedulerSolution] = None):
+    # def _add_constraint_force_before_ship_date_ignore_hinted(self, pre_solution: SchedulerSolution | None = None):
     #     hinted_event_ids = set()
     #     if pre_solution:
     #         hinted_event_ids = {e["groupId"] for e in pre_solution.schedule}
@@ -521,15 +521,15 @@ class SchedulerSolver:
         enumeration_model.clear_objective()
         enumeration_model.add(enumeration_objective_var == optimal_objective)
 
-        cloned_event_to_machine: Dict[int, cp_model.IntVar] = {
+        cloned_event_to_machine: dict[int, cp_model.IntVar] = {
             group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
             for group_id, var in self._event_vars.event_to_machine.items()
         }
-        cloned_event_start: Dict[int, cp_model.IntVar] = {
+        cloned_event_start: dict[int, cp_model.IntVar] = {
             group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
             for group_id, var in self._event_vars.event_start.items()
         }
-        cloned_event_end: Dict[int, cp_model.IntVar] = {
+        cloned_event_end: dict[int, cp_model.IntVar] = {
             group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
             for group_id, var in self._event_vars.event_end.items()
         }
@@ -1046,8 +1046,8 @@ def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_e
             events_grouped[event.designId]["flashes"] = max(events_grouped[event.designId]["flashes"], event.flashes)
     
     max_presolve_window_days = 7
-    instance: Optional[SchedulerInstance] = None
-    solution: Optional[SchedulerSolution] = None
+    instance: SchedulerInstance | None = None
+    solution: SchedulerSolution | None = None
     for presolve_days in range(0, max_presolve_window_days + 1, 1):
         # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=presolve_days)}
 
