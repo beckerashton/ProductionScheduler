@@ -40,30 +40,35 @@ class Event:
     runTime: int
     setupTime: int
     requestedShipDate: date
-    complexity: int
+    # complexity: int [DEPRECATED] - now using total color/flash data
+    colors: int
+    flashes: int
 
-    @staticmethod
-    def complexityFromColorCount(colors: int) -> int:
-        if colors <= 6:
-            return 0
-        elif colors <= 8:
-            return 1
-        elif colors <= 12:
-            return 2
-        else:
-            return 3
+    # [DEPRECATED] was used for calculating complexity tiers but now we have more granular color/flash data for better scheduling logic
+    # @staticmethod
+    # def complexityFromColorCount(colors: int) -> int:
+    #     if colors <= 6:
+    #         return 0
+    #     elif colors <= 8:
+    #         return 1
+    #     elif colors <= 12:
+    #         return 2
+    #     else:
+    #         return 3
 
     # [DEPRECATED] was used for calculating total estTime but now its split into runTime and setupTime for better granularity in scheduling logic 
-    @staticmethod
-    def estTimeFromQuantityAndColorsInMinutes(quantity: int, colors: int) -> int:
-        return int(((quantity / 250) * 60) + (colors * 10))
+    # @staticmethod
+    # def estTimeFromQuantityAndColorsInMinutes(quantity: int, colors: int) -> int:
+    #     return int(((quantity / 250) * 60) + (colors * 10))
 
 @dataclass
 class EventGroup:
     groupId: int
     designId: str
     estTime: int
-    complexity: int
+    # complexity: int [DEPRECATED] - now using total color/flash data for better scheduling logic
+    colors: int
+    flashes: int
     requestedShipDate: date
 
 @dataclass
@@ -122,7 +127,7 @@ class ProductionEvent:
         }
 
     @staticmethod
-    def from_dict(data: Dict[str, Any]) -> 'ProductionEvent':
+    def from_dict(data: Dict[str, Any]) -> 'ProductionEvent': #type: ignore  -  unused currently
         event = ProductionEvent(
             orderId=data["orderId"],
             orderDesignName=data["orderDesignName"],
