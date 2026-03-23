@@ -700,7 +700,7 @@ def _save_interactive_schedule_graph(graph_rows: list[dict], workday_minutes: in
                     "color": location_to_color[location],
                     "line": {"color": "black", "width": 0.5},
                 },
-                text=[str(row["groupId"])],
+                text=[str(row["designId"])],
                 textposition="inside",
                 name=location,
                 legendgroup=f"location_{location}",
@@ -771,7 +771,7 @@ def write_event_sequence_into_excel(solution: SchedulerSolution, filename: str) 
     
     # Read values with openpyxl, but write/save through Excel so workbook links survive.
     wb = load_workbook(filename, data_only=True, keep_links=True)
-    ws = wb["Sheet3"]
+    ws = wb["AssignEvents"]
     
     # Create a mapping of (Design No root, Location) -> solution data
     solution_map = {}
@@ -825,7 +825,7 @@ def write_event_sequence_into_excel(solution: SchedulerSolution, filename: str) 
                 solution_map[(design_root, location_str)]["setupCompleted"] = True
 
     wb.close()
-    _write_excel_cells_with_app(filename, "Sheet3", cell_updates)
+    _write_excel_cells_with_app(filename, "AssignEvents", cell_updates)
 
 
 def _model_minutes_to_datetime_text(model_minutes: float, workday_minutes: int) -> str:
@@ -931,7 +931,7 @@ def _plot_schedule_graph(
             ax.text(
                 job["scheduledStartDate"] + (job["scheduledEndDate"] - job["scheduledStartDate"]) / 2,
                 y_pos,
-                f"{job['groupId']}",
+                f"{event.designId}",
                 ha="center",
                 va="center",
                 fontsize=8,
@@ -1013,13 +1013,15 @@ def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_e
     import pandas as pd
     excel_path: str = "C:/Users/Aston/Documents/Production Scheduler Demo.xlsx"
     
-    input_df = pd.read_excel(excel_path, sheet_name="Sheet3", header=1, usecols="B,C,E,M,P,U,V,W")
+    # input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,M,P,U,V,W") # old arrangment with sts cols
+    input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,J,M,R,S,T") # new arrangement with redundant sts cols rmvd
     input_df = input_df.dropna(subset=["Order No", "Design No", "Location", "DueDate", "Imp", "No_Colors", "No_Flashes"])
-    
+    # input_df = input_df[input_df["Week_Sch"] == 13]
+
     df = input_df.rename(columns={"Order No": "id_Order", "Design No": "id_Design", "Location": "Location", "DueDate": "date_OrderRequestedToShip", "Imp": "cn_QtyToProduce", "No_Colors": "ColorsTotal", "No_Flashes": "flashes"})
     df = df.dropna(subset=["id_Order", "id_Design", "Location", "date_OrderRequestedToShip", "cn_QtyToProduce", "ColorsTotal", "flashes"])
 
-    df["runTime"] = df.apply(lambda row: row["cn_QtyToProduce"] / 250 * 60, axis=1)
+    df["runTime"] = df.apply(lambda row: row["cn_QtyToProduce"] / 300 * 60, axis=1)
     df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
     df["colors"] = df["ColorsTotal"]
     df["flashes"] = df["flashes"]
@@ -1054,7 +1056,7 @@ def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_e
         machines = [
             {"id": 1, "colors": 12, "flashes": 3},
             {"id": 2, "colors": 8, "flashes": 3},
-            {"id": 3, "colors": 12, "flashes": 3},
+            # {"id": 3, "colors": 12, "flashes": 3}, # manually toggle off because of sample prod, later samples will be integrated into scheduler as reservations
             {"id": 4, "colors": 12, "flashes": 3},  # override for 9/4 designs
             {"id": 5, "colors": 6, "flashes": 2},
             {"id": 6, "colors": 50, "flashes": 10},
@@ -1092,7 +1094,7 @@ def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_e
         solver = SchedulerSolver(instance, config)
         # solver._add_presolve_hint(pre_solution)
         # solver._set_makespan_objective()
-        solver._set_multi_makespan_objective(makespan_checks=3)
+        solver._set_multi_makespan_objective(makespan_checks=4)
         # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
         solver._add_constraint_sequence_subevents()
         # solver._add_constraint_machine_contiguous_block() # from what i can tell this isn't needed, i forget why but they already schedule contiguous

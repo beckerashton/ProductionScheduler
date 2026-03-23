@@ -1,0 +1,26 @@
+Add input to constrain events to certain machines (ie in the case of single pack for machine 2 for the folding machine) [keep in mind color constraints that will override this]
+lock in progress events
+Add input for current run state
+
+Prefer to stack work onto few machines rather than spread when underfed
+
+Generally never do small jobs on 1 and 4 and stryker
+
+Make graph show proper name of event
+
+Allow long subevents to overlap (min sub length 3hr overlap 1hr [check up on these thresh later])
+
+reservation style sampling is approved but later (pretty plug and play to turn on once other systems ready)
+
+ - Stryker - 
+Flock + Foil has to be stryker
+Stryker Min Heuristic 8 colors
+
+ - sequencing - 
+(front left <-> sleeve <-> full front) < Locker Tag < Full Back
+aggregate sequencing into [front]^ and |  ^[back] with like types being interchangeable
+
+Same weird types like totes and sleeves should be sequenced consecutively
+ - sleeves and locker tags use the same pallet
+
+Foil type must be the tail subevent

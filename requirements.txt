@@ -8,3 +8,5 @@ pydantic
 pyodbc
 python-dotenv
 scipy
+nicegui
+plotly
