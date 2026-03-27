@@ -65,11 +65,12 @@ class Event:
 class EventGroup:
     groupId: int
     designId: str
+    designName: str
     estTime: int
     # complexity: int [DEPRECATED] - now using total color/flash data for better scheduling logic
     colors: int
     flashes: int
-    requestedShipDate: date
+    requestedShipDate: int
 
 @dataclass
 class ProductionEvent:

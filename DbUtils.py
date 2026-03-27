@@ -607,4 +607,5 @@ def refresh() -> None:
     getUnscheduledOrders(lookBackRange= 30, lookAheadRange= 90, saveToCsv= extPath)
 
 # if __name__ == "__main__":
-#     getHistoricalScheduledOrders()
+#     with getConnection(connectionString= CON_STRING.replace("?", "Data_Events")) as cnxn:
+#         peek(cnxn= cnxn, table= "Events")

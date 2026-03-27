@@ -83,15 +83,52 @@ def _event_duration(event: EventGroup) -> int:
     return duration
 
 
+def _subevent_side_group(design_id: str) -> str | None:
+    if "_" not in design_id:
+        return None
+
+    location = design_id.split("_", 1)[1].strip().lower()
+    if any(keyword in location for keyword in ("front", "sleeve", "pocket")):
+        return "front"
+    if any(keyword in location for keyword in ("back", "locker tag")):
+        return "back"
+    return None
+
+
+def _color_bracket(colors: int) -> int:
+    color_count = max(0, int(colors))
+    if color_count <= 6:
+        return 0
+    if color_count <= 8:
+        return 1
+    if color_count <= 12:
+        return 2
+    return 3
+
+
+def _is_overqualified_machine_assignment(event_colors: int, machine_id: int, machine_colors: int) -> bool:
+    # Guardrail requested: machine 1/4/6 should avoid very low-color jobs.
+    # if machine_id not in (1, 4, 6): # this makes it only 1,4,6 but i have it off to be a global guard
+    #     return False
+    return (_color_bracket(machine_colors) - _color_bracket(event_colors)) >= 2
+
 class _EventSchedulingVars:
-    def __init__(self, instance: SchedulerInstance, model: cp_model.CpModel):
+    def __init__(self, instance: SchedulerInstance, model: cp_model.CpModel, locked_events: list[dict] | None = None):
         self.event_to_machine = {}
         self.event_start = {}
         self.event_end = {}
         self.event_presence = {}
         self.machine_intervals = collections.defaultdict(list)
 
-        self.horizon = sum(_event_duration(event) for event in instance.events) + max(event.requestedShipDate for event in instance.events)
+        self.horizon = sum(_event_duration(event) for event in instance.events) * 2 # arbitrary horizon that should be double what is actually needed
+        available_machine_ids = {int(machine["id"]) for machine in instance.machines}
+        machine_colors_by_id = {int(machine["id"]): int(machine["colors"]) for machine in instance.machines}
+
+        # Build lookup of forced machine assignments from locked events so they bypass guardrails
+        forced_machine_by_group: dict[int, set[int]] = collections.defaultdict(set)
+        if locked_events:
+            for lock in locked_events:
+                forced_machine_by_group[int(lock["groupId"])].add(int(lock["machineId"]))
 
         for event in instance.events:
             duration = _event_duration(event)
@@ -99,10 +136,33 @@ class _EventSchedulingVars:
             if not isinstance(requested_ship_date, int):
                 raise ValueError(f"Event {event.groupId} requestedShipDate must be an integer for this prototype.")
 
-            eligible_machine_ids = [m["id"] for m in instance.machines if m["colors"] >= event.colors and m["flashes"] >= event.flashes]
+            forced_machines_for_event = forced_machine_by_group.get(event.groupId, set())
+
+            eligible_machine_ids = [
+                int(machine["id"])
+                for machine in instance.machines
+                if int(machine["colors"]) >= event.colors
+                and int(machine["flashes"]) >= event.flashes
+                and not _is_overqualified_machine_assignment(
+                    event.colors,
+                    int(machine["id"]),
+                    int(machine["colors"]),
+                )
+            ]
             # also manual add machine 4's secondary cap of 9/4 if 4 is not already in list
-            if 4 not in eligible_machine_ids and event.colors <= 9 and event.flashes <= 4:
+            if (
+                4 in available_machine_ids
+                and 4 not in eligible_machine_ids
+                and event.colors <= 9
+                and event.flashes <= 4
+                and not _is_overqualified_machine_assignment(event.colors, 4, machine_colors_by_id[4])
+            ):
                 eligible_machine_ids.append(4)
+
+            # Forced (locked) machines bypass all guardrails — add any that aren't already eligible
+            for forced_machine_id in forced_machines_for_event:
+                if forced_machine_id in available_machine_ids and forced_machine_id not in eligible_machine_ids:
+                    eligible_machine_ids.append(forced_machine_id)
 
             if not eligible_machine_ids:
                 raise ValueError(f"Event {event.groupId} has no eligible machines.")
@@ -154,6 +214,7 @@ def _build_schedule_snapshot(
         {
             "groupId": event.groupId,
             "designId": event.designId,
+            "designName": event.designName,
             "assignedMachineId": _read_solution_value(value_source, event_to_machine[event.groupId]),
             "scheduledStartDate": _read_solution_value(value_source, event_start[event.groupId]),
             "scheduledEndDate": _read_solution_value(value_source, event_end[event.groupId]),
@@ -170,6 +231,19 @@ def _schedule_signature(schedule: list[dict]) -> tuple[tuple[int, int, int, int]
         (job["groupId"], job["assignedMachineId"], job["scheduledStartDate"], job["scheduledEndDate"])
         for job in sorted(schedule, key=lambda row: row["groupId"])
     )
+
+
+def _machine_makespan_signature(
+    schedule: list[dict],
+    machine_ids: list[int],
+) -> tuple[tuple[int, int], ...]:
+    machine_makespan = {machine_id: 0 for machine_id in machine_ids}
+    for job in schedule:
+        machine_id = int(job["assignedMachineId"])
+        machine_end = int(job["scheduledEndDate"])
+        if machine_id in machine_makespan and machine_end > machine_makespan[machine_id]:
+            machine_makespan[machine_id] = machine_end
+    return tuple((machine_id, machine_makespan[machine_id]) for machine_id in sorted(machine_makespan))
 
 
 class _ScheduleCollector(cp_model.CpSolverSolutionCallback):
@@ -204,11 +278,12 @@ class _ScheduleCollector(cp_model.CpSolverSolutionCallback):
 
 
 class SchedulerSolver:
-    def __init__(self, instance: SchedulerInstance, config: SchedulerSolverConfig):
+    def __init__(self, instance: SchedulerInstance, config: SchedulerSolverConfig, locked_events: list[dict] | None = None):
         self.instance = instance
         self.config = config
         self.model = cp_model.CpModel()
-        self._event_vars = _EventSchedulingVars(instance, self.model)
+        self._event_vars = _EventSchedulingVars(instance, self.model, locked_events)
+        self._machine_used_vars: dict[int, cp_model.IntVar] | None = None
         self._objective_var: cp_model.IntVar | None = None
         self._build_model()
         self.solver = cp_model.CpSolver()
@@ -216,6 +291,7 @@ class SchedulerSolver:
     def _add_default_constraints(self):
         # self._add_constraint_force_before_ship_date()
         self._add_constraint_machine_no_overlap()
+        self._add_constraint_machine_hours_limit()
         self._add_constraint_machine_contiguous_block()
         # self._add_constraint_pad_between_events()
 
@@ -238,6 +314,56 @@ class SchedulerSolver:
     #         if event.requestedShipDate > 0 and event.groupId not in hinted_event_ids:
     #             self.model.add(self._event_vars.event_end[event.groupId] <= event.requestedShipDate)
 
+    def _get_machine_used_vars(self) -> dict[int, cp_model.IntVar]:
+        if self._machine_used_vars is not None:
+            return self._machine_used_vars
+
+        machine_used_vars: dict[int, cp_model.IntVar] = {}
+        for machine in self.instance.machines:
+            machine_id = int(machine["id"])
+            machine_events = [
+                event
+                for event in self.instance.events
+                if (event.groupId, machine_id) in self._event_vars.event_presence
+            ]
+            presences = [
+                self._event_vars.event_presence[event.groupId, machine_id]
+                for event in machine_events
+            ]
+
+            machine_used = self.model.new_bool_var(f"machine_{machine_id}_used")
+            if presences:
+                self.model.add(sum(presences) >= 1).only_enforce_if(machine_used)
+                self.model.add(sum(presences) == 0).only_enforce_if(machine_used.Not())
+            else:
+                self.model.add(machine_used == 0)
+
+            machine_used_vars[machine_id] = machine_used
+
+        self._machine_used_vars = machine_used_vars
+        return machine_used_vars
+
+    def _set_machine_fill_prioritized_objective(
+        self,
+        base_objective: cp_model.IntVar,
+        base_upper_bound: int,
+        objective_name: str,
+    ) -> None:
+        machine_used_vars = self._get_machine_used_vars()
+        machine_count = len(machine_used_vars)
+
+        used_machine_count = self.model.new_int_var(0, machine_count, "used_machine_count")
+        self.model.add(used_machine_count == sum(machine_used_vars.values()))
+
+        base_ub = max(0, int(base_upper_bound))
+        fill_priority_weight = base_ub + 1
+        combined_upper = machine_count * fill_priority_weight + base_ub
+        combined_objective = self.model.new_int_var(0, combined_upper, objective_name)
+        self.model.add(combined_objective == used_machine_count * fill_priority_weight + base_objective)
+
+        self._objective_var = combined_objective
+        self.model.minimize(combined_objective)
+
     def _add_constraint_machine_no_overlap(self):
         for machine in self.instance.machines:
             machine_id = machine["id"]
@@ -247,6 +373,7 @@ class SchedulerSolver:
 
     def _add_constraint_machine_contiguous_block(self):
         horizon = self._event_vars.horizon
+        machine_used_vars = self._get_machine_used_vars()
 
         for machine in self.instance.machines:
             machine_id = machine["id"]
@@ -258,14 +385,7 @@ class SchedulerSolver:
             if not machine_events:
                 continue
 
-            presences = [
-                self._event_vars.event_presence[event.groupId, machine_id]
-                for event in machine_events
-            ]
-
-            machine_used = self.model.new_bool_var(f"machine_{machine_id}_used")
-            self.model.add(sum(presences) >= 1).only_enforce_if(machine_used)
-            self.model.add(sum(presences) == 0).only_enforce_if(machine_used.Not())
+            machine_used = machine_used_vars[machine_id]
 
             adjusted_starts = []
             adjusted_ends = []
@@ -311,21 +431,53 @@ class SchedulerSolver:
             )
             self.model.add(total_processing_time == busy_span)
 
+    def _add_constraint_machine_hours_limit(self):
+        # minutes_per_model_week = 5 * 8 * 60
+        # horizon_weeks = max(1, (self._event_vars.horizon + minutes_per_model_week - 1) // minutes_per_model_week)
+
+        for machine in self.instance.machines:
+            machine_id = machine["id"]
+            max_minutes = round(max(0, int(machine.get("hours_per_week", 40))) * 60 * 1.2) # 1.2 is just a buffer so it doesnt err on prod overflow
+
+            machine_events = [
+                event
+                for event in self.instance.events
+                if (event.groupId, machine_id) in self._event_vars.event_presence
+            ]
+            if not machine_events:
+                continue
+
+            total_processing_time = sum(
+                _event_duration(event) * self._event_vars.event_presence[event.groupId, machine_id]
+                for event in machine_events
+            )
+            self.model.add(total_processing_time <= max_minutes)
+
     def _add_constraint_sequence_subevents(self):
-        # force events with the same designId root to have its subevents scheduled in misc>Front Left Chest>Sleeve>Full Front>Full Back order
         root_to_subevents = collections.defaultdict(list)
         for event in self.instance.events:
             root_id = event.designId.split("_")[0]
             root_to_subevents[root_id].append(event)
+
         for root_id, subevents in root_to_subevents.items():
             if len(subevents) <= 1:
                 continue
-            # sort order Front Left Chest>Sleeve>Full Front>Full Back with any unspecified going first
-            subevents.sort(key=lambda e: ["Front Left Chest", "Sleeve", "Full Front", "Full Back"].index(e.designId.split("_")[1]) if e.designId.split("_")[1] in ["Front Left Chest", "Sleeve", "Full Front", "Full Back"] else -1)
-            for i in range(len(subevents) - 1):
-                event_i = subevents[i]
-                event_j = subevents[i + 1]
-                self.model.add(self._event_vars.event_end[event_i.groupId] <= self._event_vars.event_start[event_j.groupId])
+
+            front_subevents = [
+                event for event in subevents
+                if _subevent_side_group(event.designId) == "front"
+            ]
+            back_subevents = [
+                event for event in subevents
+                if _subevent_side_group(event.designId) == "back"
+            ]
+
+            for front_event in front_subevents:
+                for back_event in back_subevents:
+                    self.model.add(
+                        self._event_vars.event_end[front_event.groupId]
+                        <= self._event_vars.event_start[back_event.groupId]
+                    )
 
     # constraint that on the same machine there is a gap of 1 time unit between events
     def _add_constraint_pad_between_events(self):
@@ -350,6 +502,33 @@ class SchedulerSolver:
                         self.model.add(interval_j.EndExpr() + 1 <= interval_i.StartExpr()).only_enforce_if(
                             [presence_i, presence_j]
                         )
+    
+    def _add_constraint_locked_events(self, locked_events: list[dict]) -> None:
+        """
+        Enforce locked events:
+        - locked_events is a list of dicts with keys: groupId (int), machineId (int), startTime (int, optional)
+        - Each locked event is forced to the specified machine and optionally to a specific start time.
+        """
+        for locked_event in locked_events:
+            group_id = int(locked_event["groupId"])
+            machine_id = int(locked_event["machineId"])
+            start_time = locked_event.get("startTime")
+            
+            # Check that the event exists in the instance
+            event = next((e for e in self.instance.events if e.groupId == group_id), None)
+            if event is None:
+                raise ValueError(f"Locked event {group_id} not found in instance.")
+            
+            # Force the machine assignment for this event
+            if (group_id, machine_id) in self._event_vars.event_presence:
+                self.model.add(self._event_vars.event_to_machine[group_id] == machine_id)
+                self.model.add(self._event_vars.event_presence[group_id, machine_id] == 1)
+            else:
+                raise ValueError(f"Event {group_id} cannot be assigned to machine {machine_id}.")
+            
+            # If start time is specified, lock it to that time (in model minutes)
+            if start_time is not None:
+                self.model.add(self._event_vars.event_start[group_id] == int(start_time))
                         
     def _add_soft_deadline_penalty(self):
         penalties = []
@@ -373,8 +552,11 @@ class SchedulerSolver:
     def _set_makespan_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
         self.model.add_max_equality(makespan, [self._event_vars.event_end[event.groupId] for event in self.instance.events])
-        self._objective_var = makespan
-        self.model.minimize(makespan)
+        self._set_machine_fill_prioritized_objective(
+            makespan,
+            self._event_vars.horizon,
+            "machine_fill_makespan_objective",
+        )
 
     # Multi-layered makespan objective that minimizes the makespan on each subset of machines
     # where each iteration of ignores the previous max makespan machines to create a secondary objective of minimizing the makespan of the remaining machines, and so on for a specified number of iterations (makespan_checks)
@@ -440,8 +622,11 @@ class SchedulerSolver:
             "multi_makespan_objective",
         )
         self.model.add(weighted_objective == sum(objective_terms))
-        self._objective_var = weighted_objective
-        self.model.minimize(weighted_objective)
+        self._set_machine_fill_prioritized_objective(
+            weighted_objective,
+            weighted_objective_upper_bound,
+            "machine_fill_multi_makespan_objective",
+        )
 
     def _set_makespan_with_tardiness_penalty_objective(self):
         makespan = self.model.new_int_var(0, self._event_vars.horizon, "makespan")
@@ -454,8 +639,11 @@ class SchedulerSolver:
             "makespan_with_tardiness_penalty",
         )
         self.model.add(weighted_objective == makespan + 1000 * sum(penalties))
-        self._objective_var = weighted_objective
-        self.model.minimize(weighted_objective)
+        self._set_machine_fill_prioritized_objective(
+            weighted_objective,
+            self._event_vars.horizon + 1000 * max_total_penalty,
+            "machine_fill_tardy_objective",
+        )
 
     def _set_balanced_objective(self):
         """
@@ -484,8 +672,11 @@ class SchedulerSolver:
 
         balanced_objective = self.model.new_int_var(0, self._event_vars.horizon * 11, "balanced_objective")
         self.model.add(balanced_objective == makespan * 10 + (max_load - min_load))
-        self._objective_var = balanced_objective
-        self.model.minimize(balanced_objective)  # Weighted multi-objective
+        self._set_machine_fill_prioritized_objective(
+            balanced_objective,
+            self._event_vars.horizon * 11,
+            "machine_fill_balanced_objective",
+        )
 
     def _build_model(self):
         self._add_default_constraints()
@@ -508,18 +699,22 @@ class SchedulerSolver:
     def _enumerate_equally_optimal_schedules(
         self,
         primary_schedule: list[dict],
-        optimal_objective_value: float,
+        best_objective_value: float,
         time_limit: float | None = None,
     ) -> list[list[dict]]:
         if self._objective_var is None:
             print("Skipped equally optimal enumeration because no objective has been set on the model.")
             return []
 
-        optimal_objective = int(round(optimal_objective_value))
+        best_objective = int(round(best_objective_value))
+        tolerance = max(0.0, float(self.config.optimization_tolerance))
+        objective_upper_bound = int(round(best_objective * (1.0 + tolerance)))
+        objective_upper_bound = max(best_objective, objective_upper_bound)
+
         enumeration_model = self.model.clone()
         enumeration_objective_var = enumeration_model.get_int_var_from_proto_index(self._objective_var.Index())
         enumeration_model.clear_objective()
-        enumeration_model.add(enumeration_objective_var == optimal_objective)
+        enumeration_model.add(enumeration_objective_var <= objective_upper_bound)
 
         cloned_event_to_machine: dict[int, cp_model.IntVar] = {
             group_id: enumeration_model.get_int_var_from_proto_index(var.Index())
@@ -545,17 +740,28 @@ class SchedulerSolver:
             enumeration_solver,
             time_limit,
             enumerate_all_solutions=True,
-            force_exact_optimal=True,
+            force_exact_optimal=False,
             num_search_workers=1,
         )
         enumeration_status = enumeration_solver.SearchForAllSolutions(enumeration_model, collector)
 
         primary_signature = _schedule_signature(primary_schedule)
-        alternate_schedules = [
-            schedule
-            for schedule in collector.schedules
-            if _schedule_signature(schedule) != primary_signature
-        ]
+        machine_ids = [int(machine["id"]) for machine in self.instance.machines]
+        seen_machine_makespan_signatures = {
+            _machine_makespan_signature(primary_schedule, machine_ids)
+        }
+        alternate_schedules: list[list[dict]] = []
+
+        for schedule in collector.schedules:
+            if _schedule_signature(schedule) == primary_signature:
+                continue
+
+            machine_signature = _machine_makespan_signature(schedule, machine_ids)
+            if machine_signature in seen_machine_makespan_signatures:
+                continue
+
+            seen_machine_makespan_signatures.add(machine_signature)
+            alternate_schedules.append(schedule)
 
         if enumeration_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(
@@ -567,7 +773,7 @@ class SchedulerSolver:
 
         if enumeration_status == cp_model.FEASIBLE:
             print(
-                "Equal-optimum enumeration hit the solver limit before exhausting all schedules; "
+                "Tolerance-based enumeration hit the solver limit before exhausting all schedules; "
                 f"returning {len(alternate_schedules)} alternate schedule(s) found so far."
             )
 
@@ -596,14 +802,11 @@ class SchedulerSolver:
             )
 
             if self.config.enumerate_all_solutions:
-                if status != cp_model.OPTIMAL:
-                    print("Skipped equally optimal enumeration because the solver did not prove optimality.")
-                else:
-                    solution.equally_optimal_schedules = self._enumerate_equally_optimal_schedules(
-                        solution.schedule,
-                        solution.objective_value,
-                        time_limit,
-                    )
+                solution.equally_optimal_schedules = self._enumerate_equally_optimal_schedules(
+                    solution.schedule,
+                    solution.objective_value,
+                    time_limit,
+                )
 
             return solution
 
@@ -1008,158 +1211,151 @@ def _plot_schedule_graph(
         print(f"Saved interactive schedule graph to {interactive_graph_path}")
     return interactive_graph_path
 
-
-def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_excel: bool = False):
-    import pandas as pd
-    excel_path: str = "C:/Users/Aston/Documents/Production Scheduler Demo.xlsx"
+# main function used when testing, now theres a ui so this is kept for reference [3/27/26]
+# def main(show_graph: bool = False, save_graph: bool = False, write_solution_to_excel: bool = False):
+#     import pandas as pd
+#     excel_path: str = "C:/Users/Aston/Documents/Production Scheduler Demo.xlsx"
     
-    # input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,M,P,U,V,W") # old arrangment with sts cols
-    input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,J,M,R,S,T") # new arrangement with redundant sts cols rmvd
-    input_df = input_df.dropna(subset=["Order No", "Design No", "Location", "DueDate", "Imp", "No_Colors", "No_Flashes"])
-    # input_df = input_df[input_df["Week_Sch"] == 13]
+#     # input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,M,P,U,V,W") # old arrangment with sts cols
+#     input_df = pd.read_excel(excel_path, sheet_name="AssignEvents", header=3, usecols="B,C,E,J,M,R,S,T") # new arrangement with redundant sts cols rmvd
+#     input_df = input_df.dropna(subset=["Order No", "Design No", "Location", "DueDate", "Imp", "No_Colors", "No_Flashes"])
+#     # input_df = input_df[input_df["Week_Sch"] == 13]
 
-    df = input_df.rename(columns={"Order No": "id_Order", "Design No": "id_Design", "Location": "Location", "DueDate": "date_OrderRequestedToShip", "Imp": "cn_QtyToProduce", "No_Colors": "ColorsTotal", "No_Flashes": "flashes"})
-    df = df.dropna(subset=["id_Order", "id_Design", "Location", "date_OrderRequestedToShip", "cn_QtyToProduce", "ColorsTotal", "flashes"])
+#     df = input_df.rename(columns={"Order No": "id_Order", "Design No": "id_Design", "Location": "Location", "DueDate": "date_OrderRequestedToShip", "Imp": "cn_QtyToProduce", "No_Colors": "ColorsTotal", "No_Flashes": "flashes"})
+#     df = df.dropna(subset=["id_Order", "id_Design", "Location", "date_OrderRequestedToShip", "cn_QtyToProduce", "ColorsTotal", "flashes"])
 
-    df["runTime"] = df.apply(lambda row: row["cn_QtyToProduce"] / 300 * 60, axis=1)
-    df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
-    df["colors"] = df["ColorsTotal"]
-    df["flashes"] = df["flashes"]
-    df["designId"] = df.apply(lambda row: f"{int(row['id_Design'])}_{row['Location']}", axis=1)
-    df["date_OrderRequestedToShip"] = df["date_OrderRequestedToShip"].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else date.fromisoformat(x) if isinstance(x, str) else x)
+#     df["runTime"] = df.apply(lambda row: row["cn_QtyToProduce"] / 300 * 60, axis=1)
+#     df["setupTime"] = df.apply(lambda row: row["ColorsTotal"] * 10, axis=1)
+#     df["colors"] = df["ColorsTotal"]
+#     df["flashes"] = df["flashes"]
+#     df["designId"] = df.apply(lambda row: f"{int(row['id_Design'])}_{row['Location']}", axis=1)
+#     df["date_OrderRequestedToShip"] = df["date_OrderRequestedToShip"].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else date.fromisoformat(x) if isinstance(x, str) else x)
 
-    events = [
-        Event(
-            row["id_Order"], row["designId"], 
-            row["runTime"], row["setupTime"], 
-            row["date_OrderRequestedToShip"], 
-            row["colors"], row["flashes"]
-        ) for _, row in df.iterrows()
-    ]
+#     events = [
+#         Event(
+#             row["id_Order"], row["designId"], 
+#             row["runTime"], row["setupTime"], 
+#             row["date_OrderRequestedToShip"], 
+#             row["colors"], row["flashes"]
+#         ) for _, row in df.iterrows()
+#     ]
 
-    events_grouped = collections.defaultdict(lambda: {"estTime": 0, "requestedShipDate": 0, "colors": 0, "flashes": 0})
-    for event in events:
-        if event.designId not in events_grouped:
-            events_grouped[event.designId] = {"estTime": event.setupTime + event.runTime, "requestedShipDate": event.requestedShipDate, "colors": event.colors, "flashes": event.flashes} # pyright: ignore[reportArgumentType]
-        else:
-            events_grouped[event.designId]["estTime"] += event.runTime
-            events_grouped[event.designId]["requestedShipDate"] = min(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate) # pyright: ignore[reportArgumentType]
-            events_grouped[event.designId]["colors"] = max(events_grouped[event.designId]["colors"], event.colors)
-            events_grouped[event.designId]["flashes"] = max(events_grouped[event.designId]["flashes"], event.flashes)
+#     events_grouped = collections.defaultdict(lambda: {"estTime": 0, "requestedShipDate": 0, "colors": 0, "flashes": 0})
+#     for event in events:
+#         if event.designId not in events_grouped:
+#             events_grouped[event.designId] = {"designName": event.designId, "estTime": event.setupTime + event.runTime, "requestedShipDate": event.requestedShipDate, "colors": event.colors, "flashes": event.flashes} # pyright: ignore[reportArgumentType]
+#         else:
+#             events_grouped[event.designId]["estTime"] += event.runTime
+#             events_grouped[event.designId]["requestedShipDate"] = min(events_grouped[event.designId]["requestedShipDate"], event.requestedShipDate) # pyright: ignore[reportArgumentType]
+#             events_grouped[event.designId]["colors"] = max(events_grouped[event.designId]["colors"], event.colors)
+#             events_grouped[event.designId]["flashes"] = max(events_grouped[event.designId]["flashes"], event.flashes)
     
-    max_presolve_window_days = 7
-    instance: SchedulerInstance | None = None
-    solution: SchedulerSolution | None = None
-    for presolve_days in range(0, max_presolve_window_days + 1, 1):
-        # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=presolve_days)}
+#     max_presolve_window_days = 7
+#     instance: SchedulerInstance | None = None
+#     solution: SchedulerSolution | None = None
+#     for presolve_days in range(0, max_presolve_window_days + 1, 1):
+#         # late_events_grouped = {k: v for k, v in events_grouped.items() if date.fromisoformat(v["requestedShipDate"]) <= date.today() + pd.Timedelta(days=presolve_days)}
 
-        machines = [
-            {"id": 1, "colors": 12, "flashes": 3},
-            {"id": 2, "colors": 8, "flashes": 3},
-            # {"id": 3, "colors": 12, "flashes": 3}, # manually toggle off because of sample prod, later samples will be integrated into scheduler as reservations
-            {"id": 4, "colors": 12, "flashes": 3},  # override for 9/4 designs
-            {"id": 5, "colors": 6, "flashes": 2},
-            {"id": 6, "colors": 50, "flashes": 10},
-            {"id": 7, "colors": 6, "flashes": 3},
-        ]
+#         machines = [
+#             {"id": 1, "colors": 12, "flashes": 3},
+#             {"id": 2, "colors": 8, "flashes": 3},
+#             # {"id": 3, "colors": 12, "flashes": 3}, # manually toggle off because of sample prod, later samples will be integrated into scheduler as reservations
+#             {"id": 4, "colors": 12, "flashes": 3},  # override for 9/4 designs
+#             {"id": 5, "colors": 6, "flashes": 2},
+#             {"id": 6, "colors": 50, "flashes": 10},
+#             {"id": 7, "colors": 6, "flashes": 3},
+#         ]
 
-        # pre solve with tighter constraints on late events to use for a min solve hint for a full solve
-        # pre_machines = [v for v in machines if v["capability"] <= max(event["complexity"] for event in late_events_grouped.values())]
+#         # pre solve with tighter constraints on late events to use for a min solve hint for a full solve
+#         # pre_machines = [v for v in machines if v["capability"] <= max(event["complexity"] for event in late_events_grouped.values())]
 
-        # pre_instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(late_events_grouped.items())],
-        #     machines=pre_machines
-        # )
+#         # pre_instance = SchedulerInstance(events=[DummyEvent(i, k, v["estTime"], v["requestedShipDate"], v["complexity"]) for i, (k, v) in enumerate(late_events_grouped.items())],
+#         #     machines=pre_machines
+#         # )
 
-        config = SchedulerSolverConfig(
-            time_limit_seconds=30, 
-            log_search_progress=False, 
-            optimization_tolerance=0.01, 
-            num_search_workers=16,
-            enumerate_all_solutions=False
-        )
-        # pre_solver = SchedulerSolver(pre_instance, config)
-        # pre_solver._set_balanced_objective()
-        # pre_solver._add_constraint_sequence_subevents()
-        # pre_solution = pre_solver.solve(time_limit=30)
-        # print(f"Pre-solve on late events - Solution status: {pre_solution.status}, Objective value: {pre_solution.objective_value}")
+#         config = SchedulerSolverConfig(
+#             time_limit_seconds=30, 
+#             log_search_progress=False, 
+#             optimization_tolerance=0.01, 
+#             num_search_workers=16,
+#             enumerate_all_solutions=False
+#         )
+#         # pre_solver = SchedulerSolver(pre_instance, config)
+#         # pre_solver._set_balanced_objective()
+#         # pre_solver._add_constraint_sequence_subevents()
+#         # pre_solution = pre_solver.solve(time_limit=30)
+#         # print(f"Pre-solve on late events - Solution status: {pre_solution.status}, Objective value: {pre_solution.objective_value}")
 
-        # save solution for debugging
-        # pre_solution_df = pd.DataFrame(pre_solution.schedule)
-        # pre_solution_df.to_csv("Inputs/pre_solution.csv", index=False)
+#         # save solution for debugging
+#         # pre_solution_df = pd.DataFrame(pre_solution.schedule)
+#         # pre_solution_df.to_csv("Inputs/pre_solution.csv", index=False)
 
-        instance = SchedulerInstance(events=[EventGroup(i, k, v["estTime"], v["colors"], v["flashes"], v["requestedShipDate"]) for i, (k, v) in enumerate(events_grouped.items())],
-            machines=machines
-        )
+#         instance = SchedulerInstance(events=[EventGroup(i, k, str(v["designName"]), int(v["estTime"]), int(v["colors"]), int(v["flashes"]), int(v["requestedShipDate"])) for i, (k, v) in enumerate(events_grouped.items())],
+#             machines=machines
+#         )
         
-        solver = SchedulerSolver(instance, config)
-        # solver._add_presolve_hint(pre_solution)
-        # solver._set_makespan_objective()
-        solver._set_multi_makespan_objective(makespan_checks=4)
-        # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
-        solver._add_constraint_sequence_subevents()
-        # solver._add_constraint_machine_contiguous_block() # from what i can tell this isn't needed, i forget why but they already schedule contiguous
+#         solver = SchedulerSolver(instance, config)
+#         # solver._add_presolve_hint(pre_solution)
+#         # solver._set_makespan_objective()
+#         solver._set_multi_makespan_objective(makespan_checks=4)
+#         # solver._add_constraint_force_before_ship_date_ignore_hinted(pre_solution)
+#         solver._add_constraint_sequence_subevents()
+#         # solver._add_constraint_machine_contiguous_block() # from what i can tell this isn't needed, i forget why but they already schedule contiguous
 
-        solution = solver.solve()
-        print(f"Solution status: {solution.status}, Objective value: {solution.objective_value}")
+#         solution = solver.solve()
+#         print(f"Solution status: {solution.status}, Objective value: {solution.objective_value}")
 
 
 
-        if solution.status == "INFEASIBLE":
-            print(f"Failed with a presolve range of {presolve_days} days. Trying again with larger presolve range.")
-        else:
-            print(f"Succeeded with a presolve range of {presolve_days} days.")
-            if write_solution_to_excel:
-                write_event_sequence_into_excel(solution, excel_path)
-            break
+#         if solution.status == "INFEASIBLE":
+#             print(f"Failed with a presolve range of {presolve_days} days. Trying again with larger presolve range.")
+#         else:
+#             print(f"Succeeded with a presolve range of {presolve_days} days.")
+#             if write_solution_to_excel:
+#                 write_event_sequence_into_excel(solution, excel_path)
+#             break
     
-    assert instance is not None, "Instance should have been created in the presolve loop."
-    assert solution is not None, "Solver failed to find any solution across all presolve ranges."
-    # save the final solution to csv for debugging organized by start date then machine
-    # solution_df = pd.DataFrame(solution.schedule)
-    # solution_df = solution_df.sort_values(by=["scheduledStartDate", "assignedMachineId"])
-    # solution_df.to_csv("Inputs/final_solution.csv", index=False)
+#     assert instance is not None, "Instance should have been created in the presolve loop."
+#     assert solution is not None, "Solver failed to find any solution across all presolve ranges."
+#     # save the final solution to csv for debugging organized by start date then machine
+#     # solution_df = pd.DataFrame(solution.schedule)
+#     # solution_df = solution_df.sort_values(by=["scheduledStartDate", "assignedMachineId"])
+#     # solution_df.to_csv("Inputs/final_solution.csv", index=False)
 
-    workday_minutes = 8 * 60
+#     workday_minutes = 8 * 60
 
-    def _model_minutes_to_excel_date(model_minutes: int) -> date:
-        clamped_minutes = max(0, int(model_minutes))
-        day_offset = clamped_minutes // workday_minutes
-        actual_date = date.today() + timedelta(days=day_offset)
-        return actual_date
+#     def _model_minutes_to_excel_date(model_minutes: int) -> date:
+#         clamped_minutes = max(0, int(model_minutes))
+#         day_offset = clamped_minutes // workday_minutes
+#         actual_date = date.today() + timedelta(days=day_offset)
+#         return actual_date
 
-    # Graph view
-    if solution.status in ["OPTIMAL", "FEASIBLE"]:
-        schedules_to_plot = [solution.schedule, *solution.equally_optimal_schedules]
-        total_solutions = len(schedules_to_plot)
-        if total_solutions > 1:
-            print(f"Rendering {total_solutions} equally optimal schedule graphs.")
+#     # Graph view
+#     if solution.status in ["OPTIMAL", "FEASIBLE"]:
+#         schedules_to_plot = [solution.schedule, *solution.equally_optimal_schedules]
+#         total_solutions = len(schedules_to_plot)
+#         if total_solutions > 1:
+#             print(f"Rendering {total_solutions} equally optimal schedule graphs.")
 
-        for solution_index, schedule_to_plot in enumerate(schedules_to_plot, start=1):
-            title = f"Schedule by Machine (objective {solution.objective_value:g})"
-            if total_solutions > 1:
-                title = (
-                    f"Schedule by Machine (solution {solution_index}/{total_solutions}, "
-                    f"objective {solution.objective_value:g})"
-                )
+#         for solution_index, schedule_to_plot in enumerate(schedules_to_plot, start=1):
+#             title = f"Schedule by Machine (objective {solution.objective_value:g})"
+#             if total_solutions > 1:
+#                 title = (
+#                     f"Schedule by Machine (solution {solution_index}/{total_solutions}, "
+#                     f"objective {solution.objective_value:g})"
+#                 )
 
-            interactive_output_path = None
-            if total_solutions == 1:
-                interactive_output_path = Path("Outputs") / "schedule_graph_interactive.html"
+#             interactive_output_path = None
+#             if total_solutions == 1:
+#                 interactive_output_path = Path("Outputs") / "schedule_graph_interactive.html"
 
-            _plot_schedule_graph(
-                schedule_to_plot,
-                instance,
-                workday_minutes,
-                title,
-                interactive_output_path if save_graph else None,
-            )
+#             _plot_schedule_graph(
+#                 schedule_to_plot,
+#                 instance,
+#                 workday_minutes,
+#                 title,
+#                 interactive_output_path if save_graph else None,
+#             )
 
-        if show_graph:
-            plt.show()
-
-if __name__ == "__main__":
-    main(
-        show_graph= input("Show graph? (y/n): ").strip().lower() == "y", 
-        save_graph=input("Save graph as html? (y/n): ").strip().lower() == "y", 
-        write_solution_to_excel=input("Write solution to Excel? (y/n): ").strip().lower() == "y"
-    )
+#         if show_graph:
+#             plt.show()
